@@ -22,7 +22,7 @@ email = { git = "https://github.com/deltachat/rust-email", branch = "master" }
 lettre_email = { git = "https://github.com/deltachat/lettre", branch = "native_tls" }
 
 # XXX newer commits of async-imap lead to import-export tests hanging
-async-imap = { git = "https://github.com/async-email/async-imap", branch = "dcc-stable" }
+async-imap = { git = "https://github.com/async-email/async-imap", branch = "merge-dcc" }
 
 async-native-tls = "0.1.1"
 async-std = { version = "1.0", features = ["unstable"] }
@@ -59,6 +59,7 @@ mailparse = "0.10.1"
 encoded-words = { git = "https://github.com/async-email/encoded-words", branch="master" }
 native-tls = "0.2.3"
 image = "0.22.3"
+pretty_env_logger = "0.3.1"
 
 [dev-dependencies]
 tempfile = "3.0"
