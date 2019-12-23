@@ -50,7 +50,7 @@ pub fn dc_is_configured(context: &Context) -> bool {
  * Configure JOB
  ******************************************************************************/
 #[allow(non_snake_case, unused_must_use)]
-pub fn JobConfigureImap(context: &Context) {
+pub fn JobConfigureImap(context: &Context) -> Try {
     if !context.sql.is_open() {
         error!(context, "Cannot configure, database not opened.",);
         progress!(context, 0);
