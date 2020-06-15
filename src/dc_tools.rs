@@ -3,26 +3,27 @@
 
 use core::cmp::{max, min};
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::fmt;
 use std::str::FromStr;
-use std::time::SystemTime;
-use std::{fmt, fs};
+use std::time::{Duration, SystemTime};
 
+use async_std::path::{Path, PathBuf};
+use async_std::{fs, io};
 use chrono::{Local, TimeZone};
 use rand::{thread_rng, Rng};
 
 use crate::context::Context;
-use crate::error::Error;
+use crate::error::{bail, Error};
 use crate::events::Event;
 
 pub(crate) fn dc_exactly_one_bit_set(v: i32) -> bool {
     0 != v && 0 == v & (v - 1)
 }
 
-/// Shortens a string to a specified length and adds "..." or "[...]" to the end of
-/// the shortened string.
-pub(crate) fn dc_truncate(buf: &str, approx_chars: usize, do_unwrap: bool) -> Cow<str> {
-    let ellipse = if do_unwrap { "..." } else { "[...]" };
+/// Shortens a string to a specified length and adds "[...]" to the
+/// end of the shortened string.
+pub(crate) fn dc_truncate(buf: &str, approx_chars: usize) -> Cow<str> {
+    let ellipse = "[...]";
 
     let count = buf.chars().count();
     if approx_chars > 0 && count > approx_chars + ellipse.len() {
@@ -75,6 +76,14 @@ pub fn dc_timestamp_to_str(wanted: i64) -> String {
     ts.format("%Y.%m.%d %H:%M:%S").to_string()
 }
 
+pub fn duration_to_str(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = (secs % 3600) % 60;
+    format!("{}h {}m {}s", h, m, s)
+}
+
 pub(crate) fn dc_gm2local_offset() -> i64 {
     /* returns the offset that must be _added_ to an UTC/GMT-time to create the localtime.
     the function may return negative values. */
@@ -99,9 +108,9 @@ const MAX_SECONDS_TO_LEND_FROM_FUTURE: i64 = 5;
 // returns the currently smeared timestamp,
 // may be used to check if call to dc_create_smeared_timestamp() is needed or not.
 // the returned timestamp MUST NOT be used to be sent out or saved in the database!
-pub(crate) fn dc_smeared_time(context: &Context) -> i64 {
+pub(crate) async fn dc_smeared_time(context: &Context) -> i64 {
     let mut now = time();
-    let ts = *context.last_smeared_timestamp.read().unwrap();
+    let ts = *context.last_smeared_timestamp.read().await;
     if ts >= now {
         now = ts + 1;
     }
@@ -110,11 +119,11 @@ pub(crate) fn dc_smeared_time(context: &Context) -> i64 {
 }
 
 // returns a timestamp that is guaranteed to be unique.
-pub(crate) fn dc_create_smeared_timestamp(context: &Context) -> i64 {
+pub(crate) async fn dc_create_smeared_timestamp(context: &Context) -> i64 {
     let now = time();
     let mut ret = now;
 
-    let mut last_smeared_timestamp = context.last_smeared_timestamp.write().unwrap();
+    let mut last_smeared_timestamp = context.last_smeared_timestamp.write().await;
     if ret <= *last_smeared_timestamp {
         ret = *last_smeared_timestamp + 1;
         if ret - now > MAX_SECONDS_TO_LEND_FROM_FUTURE {
@@ -129,12 +138,12 @@ pub(crate) fn dc_create_smeared_timestamp(context: &Context) -> i64 {
 // creates `count` timestamps that are guaranteed to be unique.
 // the frist created timestamps is returned directly,
 // get the other timestamps just by adding 1..count-1
-pub(crate) fn dc_create_smeared_timestamps(context: &Context, count: usize) -> i64 {
+pub(crate) async fn dc_create_smeared_timestamps(context: &Context, count: usize) -> i64 {
     let now = time();
     let count = count as i64;
     let mut start = now + min(count, MAX_SECONDS_TO_LEND_FROM_FUTURE) - count;
 
-    let mut last_smeared_timestamp = context.last_smeared_timestamp.write().unwrap();
+    let mut last_smeared_timestamp = context.last_smeared_timestamp.write().await;
     start = max(*last_smeared_timestamp + 1, start);
 
     *last_smeared_timestamp = start + count - 1;
@@ -222,45 +231,7 @@ pub(crate) fn dc_extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
     None
 }
 
-// Function returns a sanitized basename that does not contain
-// win/linux path separators and also not any non-ascii chars
-fn get_safe_basename(filename: &str) -> String {
-    // return the (potentially mangled) basename of the input filename
-    // this might be a path that comes in from another operating system
-    let mut index: usize = 0;
-
-    if let Some(unix_index) = filename.rfind('/') {
-        index = unix_index + 1;
-    }
-    if let Some(win_index) = filename.rfind('\\') {
-        index = max(index, win_index + 1);
-    }
-    if index >= filename.len() {
-        "nobasename".to_string()
-    } else {
-        // we don't allow any non-ascii to be super-safe
-        filename[index..].replace(|c: char| !c.is_ascii() || c == ':', "-")
-    }
-}
-
-pub fn dc_derive_safe_stem_ext(filename: &str) -> (String, String) {
-    let basename = get_safe_basename(&filename);
-    let (mut stem, mut ext) = if let Some(index) = basename.rfind('.') {
-        (
-            basename[0..index].to_string(),
-            basename[index..].to_string(),
-        )
-    } else {
-        (basename, "".to_string())
-    };
-    // limit length of stem and ext
-    stem.truncate(32);
-    ext.truncate(32);
-    (stem, ext)
-}
-
 // the returned suffix is lower-case
-#[allow(non_snake_case)]
 pub fn dc_get_filesuffix_lc(path_filename: impl AsRef<str>) -> Option<String> {
     Path::new(path_filename.as_ref())
         .extension()
@@ -278,11 +249,8 @@ pub fn dc_get_filemeta(buf: &[u8]) -> Result<(u32, u32), Error> {
 ///
 /// If `path` starts with "$BLOBDIR", replaces it with the blobdir path.
 /// Otherwise, returns path as is.
-pub(crate) fn dc_get_abs_path<P: AsRef<std::path::Path>>(
-    context: &Context,
-    path: P,
-) -> std::path::PathBuf {
-    let p: &std::path::Path = path.as_ref();
+pub(crate) fn dc_get_abs_path<P: AsRef<Path>>(context: &Context, path: P) -> PathBuf {
+    let p: &Path = path.as_ref();
     if let Ok(p) = p.strip_prefix("$BLOBDIR") {
         context.get_blobdir().join(p)
     } else {
@@ -290,20 +258,20 @@ pub(crate) fn dc_get_abs_path<P: AsRef<std::path::Path>>(
     }
 }
 
-pub(crate) fn dc_get_filebytes(context: &Context, path: impl AsRef<std::path::Path>) -> u64 {
+pub(crate) async fn dc_get_filebytes(context: &Context, path: impl AsRef<Path>) -> u64 {
     let path_abs = dc_get_abs_path(context, &path);
-    match fs::metadata(&path_abs) {
+    match fs::metadata(&path_abs).await {
         Ok(meta) => meta.len() as u64,
         Err(_err) => 0,
     }
 }
 
-pub(crate) fn dc_delete_file(context: &Context, path: impl AsRef<std::path::Path>) -> bool {
+pub(crate) async fn dc_delete_file(context: &Context, path: impl AsRef<Path>) -> bool {
     let path_abs = dc_get_abs_path(context, &path);
-    if !path_abs.exists() {
+    if !path_abs.exists().await {
         return false;
     }
-    if !path_abs.is_file() {
+    if !path_abs.is_file().await {
         warn!(
             context,
             "refusing to delete non-file \"{}\".",
@@ -313,9 +281,9 @@ pub(crate) fn dc_delete_file(context: &Context, path: impl AsRef<std::path::Path
     }
 
     let dpath = format!("{}", path.as_ref().to_string_lossy());
-    match fs::remove_file(path_abs) {
+    match fs::remove_file(path_abs).await {
         Ok(_) => {
-            context.call_cb(Event::DeletedBlobFile(dpath));
+            context.emit_event(Event::DeletedBlobFile(dpath));
             true
         }
         Err(err) => {
@@ -325,13 +293,13 @@ pub(crate) fn dc_delete_file(context: &Context, path: impl AsRef<std::path::Path
     }
 }
 
-pub(crate) fn dc_copy_file(
+pub(crate) async fn dc_copy_file(
     context: &Context,
-    src_path: impl AsRef<std::path::Path>,
-    dest_path: impl AsRef<std::path::Path>,
+    src_path: impl AsRef<Path>,
+    dest_path: impl AsRef<Path>,
 ) -> bool {
     let src_abs = dc_get_abs_path(context, &src_path);
-    let mut src_file = match fs::File::open(&src_abs) {
+    let mut src_file = match fs::File::open(&src_abs).await {
         Ok(file) => file,
         Err(err) => {
             warn!(
@@ -349,6 +317,7 @@ pub(crate) fn dc_copy_file(
         .create_new(true)
         .write(true)
         .open(&dest_abs)
+        .await
     {
         Ok(file) => file,
         Err(err) => {
@@ -362,7 +331,7 @@ pub(crate) fn dc_copy_file(
         }
     };
 
-    match std::io::copy(&mut src_file, &mut dest_file) {
+    match io::copy(&mut src_file, &mut dest_file).await {
         Ok(_) => true,
         Err(err) => {
             error!(
@@ -374,20 +343,20 @@ pub(crate) fn dc_copy_file(
             );
             {
                 // Attempt to remove the failed file, swallow errors resulting from that.
-                fs::remove_file(dest_abs).ok();
+                fs::remove_file(dest_abs).await.ok();
             }
             false
         }
     }
 }
 
-pub(crate) fn dc_create_folder(
+pub(crate) async fn dc_create_folder(
     context: &Context,
-    path: impl AsRef<std::path::Path>,
-) -> Result<(), std::io::Error> {
+    path: impl AsRef<Path>,
+) -> Result<(), io::Error> {
     let path_abs = dc_get_abs_path(context, &path);
-    if !path_abs.exists() {
-        match fs::create_dir_all(path_abs) {
+    if !path_abs.exists().await {
+        match fs::create_dir_all(path_abs).await {
             Ok(_) => Ok(()),
             Err(err) => {
                 warn!(
@@ -405,13 +374,13 @@ pub(crate) fn dc_create_folder(
 }
 
 /// Write a the given content to provied file path.
-pub(crate) fn dc_write_file(
+pub(crate) async fn dc_write_file(
     context: &Context,
     path: impl AsRef<Path>,
     buf: &[u8],
-) -> Result<(), std::io::Error> {
+) -> Result<(), io::Error> {
     let path_abs = dc_get_abs_path(context, &path);
-    fs::write(&path_abs, buf).map_err(|err| {
+    fs::write(&path_abs, buf).await.map_err(|err| {
         warn!(
             context,
             "Cannot write {} bytes to \"{}\": {}",
@@ -423,13 +392,10 @@ pub(crate) fn dc_write_file(
     })
 }
 
-pub fn dc_read_file<P: AsRef<std::path::Path>>(
-    context: &Context,
-    path: P,
-) -> Result<Vec<u8>, Error> {
+pub async fn dc_read_file<P: AsRef<Path>>(context: &Context, path: P) -> Result<Vec<u8>, Error> {
     let path_abs = dc_get_abs_path(context, &path);
 
-    match fs::read(&path_abs) {
+    match fs::read(&path_abs).await {
         Ok(bytes) => Ok(bytes),
         Err(err) => {
             warn!(
@@ -443,13 +409,31 @@ pub fn dc_read_file<P: AsRef<std::path::Path>>(
     }
 }
 
-pub fn dc_open_file<P: AsRef<std::path::Path>>(
+pub async fn dc_open_file<P: AsRef<Path>>(context: &Context, path: P) -> Result<fs::File, Error> {
+    let path_abs = dc_get_abs_path(context, &path);
+
+    match fs::File::open(&path_abs).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            warn!(
+                context,
+                "Cannot read \"{}\" or file is empty: {}",
+                path.as_ref().display(),
+                err
+            );
+            Err(err.into())
+        }
+    }
+}
+
+pub fn dc_open_file_std<P: AsRef<std::path::Path>>(
     context: &Context,
     path: P,
 ) -> Result<std::fs::File, Error> {
-    let path_abs = dc_get_abs_path(context, &path);
+    let p: PathBuf = path.as_ref().into();
+    let path_abs = dc_get_abs_path(context, p);
 
-    match fs::File::open(&path_abs) {
+    match std::fs::File::open(&path_abs) {
         Ok(bytes) => Ok(bytes),
         Err(err) => {
             warn!(
@@ -463,7 +447,7 @@ pub fn dc_open_file<P: AsRef<std::path::Path>>(
     }
 }
 
-pub(crate) fn dc_get_next_backup_path(
+pub(crate) async fn dc_get_next_backup_path(
     folder: impl AsRef<Path>,
     backup_time: i64,
 ) -> Result<PathBuf, Error> {
@@ -476,7 +460,7 @@ pub(crate) fn dc_get_next_backup_path(
     for i in 0..64 {
         let mut path = folder.clone();
         path.push(format!("{}-{}.bak", stem, i));
-        if !path.exists() {
+        if !path.exists().await {
             return Ok(path);
         }
     }
@@ -488,6 +472,14 @@ pub(crate) fn time() -> i64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// An invalid email address was encountered
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid email address: {message} ({addr})")]
+pub struct InvalidEmailError {
+    message: String,
+    addr: String,
 }
 
 /// Very simple email address wrapper.
@@ -506,14 +498,14 @@ pub(crate) fn time() -> i64 {
 /// assert_eq!(&email.domain, "example.com");
 /// assert_eq!(email.to_string(), "someone@example.com");
 /// ```
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct EmailAddress {
     pub local: String,
     pub domain: String,
 }
 
 impl EmailAddress {
-    pub fn new(input: &str) -> Result<Self, Error> {
+    pub fn new(input: &str) -> Result<Self, InvalidEmailError> {
         input.parse::<EmailAddress>()
     }
 }
@@ -525,31 +517,62 @@ impl fmt::Display for EmailAddress {
 }
 
 impl FromStr for EmailAddress {
-    type Err = Error;
+    type Err = InvalidEmailError;
 
     /// Performs a dead-simple parse of an email address.
-    fn from_str(input: &str) -> Result<EmailAddress, Error> {
-        ensure!(!input.is_empty(), "empty string is not valid");
+    fn from_str(input: &str) -> Result<EmailAddress, InvalidEmailError> {
+        let err = |msg: &str| {
+            Err(InvalidEmailError {
+                message: msg.to_string(),
+                addr: input.to_string(),
+            })
+        };
+        if input.is_empty() {
+            return err("empty string is not valid");
+        }
         let parts: Vec<&str> = input.rsplitn(2, '@').collect();
 
-        ensure!(parts.len() > 1, "missing '@' character");
-        let local = parts[1];
-        let domain = parts[0];
+        if input
+            .chars()
+            .any(|c| c.is_whitespace() || c == '<' || c == '>')
+        {
+            return err("Email must not contain whitespaces, '>' or '<'");
+        }
 
-        ensure!(
-            !local.is_empty(),
-            "empty string is not valid for local part"
-        );
-        ensure!(domain.len() > 3, "domain is too short");
+        match &parts[..] {
+            [domain, local] => {
+                if local.is_empty() {
+                    return err("empty string is not valid for local part");
+                }
+                if domain.len() <= 3 {
+                    return err("domain is too short");
+                }
+                let dot = domain.find('.');
+                match dot {
+                    None => {
+                        return err("invalid domain");
+                    }
+                    Some(dot_idx) => {
+                        if dot_idx >= domain.len() - 2 {
+                            return err("invalid domain");
+                        }
+                    }
+                }
+                Ok(EmailAddress {
+                    local: (*local).to_string(),
+                    domain: (*domain).to_string(),
+                })
+            }
+            _ => err("missing '@' character"),
+        }
+    }
+}
 
-        let dot = domain.find('.');
-        ensure!(dot.is_some(), "invalid domain");
-        ensure!(dot.unwrap() < domain.len() - 2, "invalid domain");
-
-        Ok(EmailAddress {
-            local: local.to_string(),
-            domain: domain.to_string(),
-        })
+impl rusqlite::types::ToSql for EmailAddress {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+        let val = rusqlite::types::Value::Text(self.to_string());
+        let out = rusqlite::types::ToSqlOutput::Owned(val);
+        Ok(out)
     }
 }
 
@@ -576,54 +599,42 @@ mod tests {
     #[test]
     fn test_dc_truncate_1() {
         let s = "this is a little test string";
-        assert_eq!(dc_truncate(s, 16, false), "this is a [...]");
-        assert_eq!(dc_truncate(s, 16, true), "this is a ...");
+        assert_eq!(dc_truncate(s, 16), "this is a [...]");
     }
 
     #[test]
     fn test_dc_truncate_2() {
-        assert_eq!(dc_truncate("1234", 2, false), "1234");
-        assert_eq!(dc_truncate("1234", 2, true), "1234");
+        assert_eq!(dc_truncate("1234", 2), "1234");
     }
 
     #[test]
     fn test_dc_truncate_3() {
-        assert_eq!(dc_truncate("1234567", 1, false), "1[...]");
-        assert_eq!(dc_truncate("1234567", 1, true), "1...");
+        assert_eq!(dc_truncate("1234567", 1), "1[...]");
     }
 
     #[test]
     fn test_dc_truncate_4() {
-        assert_eq!(dc_truncate("123456", 4, false), "123456");
-        assert_eq!(dc_truncate("123456", 4, true), "123456");
+        assert_eq!(dc_truncate("123456", 4), "123456");
     }
 
     #[test]
     fn test_dc_truncate_edge() {
-        assert_eq!(dc_truncate("", 4, false), "");
-        assert_eq!(dc_truncate("", 4, true), "");
+        assert_eq!(dc_truncate("", 4), "");
 
-        assert_eq!(dc_truncate("\n  hello \n world", 4, false), "\n  [...]");
-        assert_eq!(dc_truncate("\n  hello \n world", 4, true), "\n  ...");
+        assert_eq!(dc_truncate("\n  hello \n world", 4), "\n  [...]");
 
+        assert_eq!(dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 1), "𐠈[...]");
         assert_eq!(
-            dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 1, false),
-            "𐠈[...]"
-        );
-        assert_eq!(
-            dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 0, false),
+            dc_truncate("𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ", 0),
             "𐠈0Aᝮa𫝀®!ꫛa¡0A𐢧00𐹠®A  丽ⷐએ"
         );
 
         // 9 characters, so no truncation
-        assert_eq!(
-            dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠", 6, false),
-            "𑒀ὐ￠🜀\u{1e01b}A a🟠",
-        );
+        assert_eq!(dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠", 6), "𑒀ὐ￠🜀\u{1e01b}A a🟠",);
 
         // 12 characters, truncation
         assert_eq!(
-            dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠bcd", 6, false),
+            dc_truncate("𑒀ὐ￠🜀\u{1e01b}A a🟠bcd", 6),
             "𑒀ὐ￠🜀\u{1e01b}A[...]",
         );
     }
@@ -654,7 +665,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn test_dc_extract_grpid_from_rfc724_mid() {
         // Should return None if we pass invalid mid
@@ -709,29 +719,29 @@ mod tests {
 
     #[test]
     fn test_emailaddress_parse() {
-        assert_eq!(EmailAddress::new("").is_ok(), false);
+        assert_eq!("".parse::<EmailAddress>().is_ok(), false);
         assert_eq!(
-            EmailAddress::new("user@domain.tld").unwrap(),
+            "user@domain.tld".parse::<EmailAddress>().unwrap(),
             EmailAddress {
                 local: "user".into(),
                 domain: "domain.tld".into(),
             }
         );
-        assert_eq!(EmailAddress::new("uuu").is_ok(), false);
-        assert_eq!(EmailAddress::new("dd.tt").is_ok(), false);
-        assert_eq!(EmailAddress::new("tt.dd@uu").is_ok(), false);
-        assert_eq!(EmailAddress::new("u@d").is_ok(), false);
-        assert_eq!(EmailAddress::new("u@d.").is_ok(), false);
-        assert_eq!(EmailAddress::new("u@d.t").is_ok(), false);
+        assert_eq!("uuu".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("dd.tt".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("tt.dd@uu".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("u@d".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("u@d.".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("u@d.t".parse::<EmailAddress>().is_ok(), false);
         assert_eq!(
-            EmailAddress::new("u@d.tt").unwrap(),
+            "u@d.tt".parse::<EmailAddress>().unwrap(),
             EmailAddress {
                 local: "u".into(),
                 domain: "d.tt".into(),
             }
         );
-        assert_eq!(EmailAddress::new("u@.tt").is_ok(), false);
-        assert_eq!(EmailAddress::new("@d.tt").is_ok(), false);
+        assert_eq!("u@tt".parse::<EmailAddress>().is_ok(), false);
+        assert_eq!("@d.tt".parse::<EmailAddress>().is_ok(), false);
     }
 
     use proptest::prelude::*;
@@ -740,11 +750,10 @@ mod tests {
         #[test]
         fn test_dc_truncate(
             buf: String,
-            approx_chars in 0..10000usize,
-            do_unwrap: bool,
+            approx_chars in 0..10000usize
         ) {
-            let res = dc_truncate(&buf, approx_chars, do_unwrap);
-            let el_len = if do_unwrap { 3 } else { 5 };
+            let res = dc_truncate(&buf, approx_chars);
+            let el_len = 5;
             let l = res.chars().count();
             if approx_chars > 0 {
                 assert!(
@@ -758,53 +767,40 @@ mod tests {
 
             if approx_chars > 0 && buf.chars().count() > approx_chars + el_len {
                 let l = res.len();
-                if do_unwrap {
-                    assert_eq!(&res[l-3..l], "...", "missing ellipsis in {}", &res);
-                } else {
-                    assert_eq!(&res[l-5..l], "[...]", "missing ellipsis in {}", &res);
-                }
+                assert_eq!(&res[l-5..l], "[...]", "missing ellipsis in {}", &res);
             }
         }
     }
 
-    #[test]
-    fn test_file_get_safe_basename() {
-        assert_eq!(get_safe_basename("12312/hello"), "hello");
-        assert_eq!(get_safe_basename("12312\\hello"), "hello");
-        assert_eq!(get_safe_basename("//12312\\hello"), "hello");
-        assert_eq!(get_safe_basename("//123:12\\hello"), "hello");
-        assert_eq!(get_safe_basename("//123:12/\\\\hello"), "hello");
-        assert_eq!(get_safe_basename("//123:12//hello"), "hello");
-        assert_eq!(get_safe_basename("//123:12//"), "nobasename");
-        assert_eq!(get_safe_basename("//123:12/"), "nobasename");
-        assert!(get_safe_basename("123\x012.hello").ends_with(".hello"));
-    }
-
-    #[test]
-    fn test_file_handling() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_file_handling() {
+        let t = dummy_context().await;
         let context = &t.ctx;
-        let dc_file_exist = |ctx: &Context, fname: &str| {
-            ctx.get_blobdir()
-                .join(Path::new(fname).file_name().unwrap())
-                .exists()
-        };
-
-        assert!(!dc_delete_file(context, "$BLOBDIR/lkqwjelqkwlje"));
-        if dc_file_exist(context, "$BLOBDIR/foobar")
-            || dc_file_exist(context, "$BLOBDIR/dada")
-            || dc_file_exist(context, "$BLOBDIR/foobar.dadada")
-            || dc_file_exist(context, "$BLOBDIR/foobar-folder")
-        {
-            dc_delete_file(context, "$BLOBDIR/foobar");
-            dc_delete_file(context, "$BLOBDIR/dada");
-            dc_delete_file(context, "$BLOBDIR/foobar.dadada");
-            dc_delete_file(context, "$BLOBDIR/foobar-folder");
+        macro_rules! dc_file_exist {
+            ($ctx:expr, $fname:expr) => {
+                $ctx.get_blobdir()
+                    .join(Path::new($fname).file_name().unwrap())
+                    .exists()
+            };
         }
-        assert!(dc_write_file(context, "$BLOBDIR/foobar", b"content").is_ok());
-        assert!(dc_file_exist(context, "$BLOBDIR/foobar",));
-        assert!(!dc_file_exist(context, "$BLOBDIR/foobarx"));
-        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/foobar"), 7);
+
+        assert!(!dc_delete_file(context, "$BLOBDIR/lkqwjelqkwlje").await);
+        if dc_file_exist!(context, "$BLOBDIR/foobar").await
+            || dc_file_exist!(context, "$BLOBDIR/dada").await
+            || dc_file_exist!(context, "$BLOBDIR/foobar.dadada").await
+            || dc_file_exist!(context, "$BLOBDIR/foobar-folder").await
+        {
+            dc_delete_file(context, "$BLOBDIR/foobar").await;
+            dc_delete_file(context, "$BLOBDIR/dada").await;
+            dc_delete_file(context, "$BLOBDIR/foobar.dadada").await;
+            dc_delete_file(context, "$BLOBDIR/foobar-folder").await;
+        }
+        assert!(dc_write_file(context, "$BLOBDIR/foobar", b"content")
+            .await
+            .is_ok());
+        assert!(dc_file_exist!(context, "$BLOBDIR/foobar").await);
+        assert!(!dc_file_exist!(context, "$BLOBDIR/foobarx").await);
+        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/foobar").await, 7);
 
         let abs_path = context
             .get_blobdir()
@@ -812,31 +808,33 @@ mod tests {
             .to_string_lossy()
             .to_string();
 
-        assert!(dc_file_exist(context, &abs_path));
+        assert!(dc_file_exist!(context, &abs_path).await);
 
-        assert!(dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada",));
+        assert!(dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada").await);
 
         // attempting to copy a second time should fail
-        assert!(!dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada",));
+        assert!(!dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada").await);
 
-        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/dada",), 7);
+        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/dada").await, 7);
 
-        let buf = dc_read_file(context, "$BLOBDIR/dada").unwrap();
+        let buf = dc_read_file(context, "$BLOBDIR/dada").await.unwrap();
 
         assert_eq!(buf.len(), 7);
         assert_eq!(&buf, b"content");
 
-        assert!(dc_delete_file(context, "$BLOBDIR/foobar"));
-        assert!(dc_delete_file(context, "$BLOBDIR/dada"));
-        assert!(dc_create_folder(context, "$BLOBDIR/foobar-folder").is_ok());
-        assert!(dc_file_exist(context, "$BLOBDIR/foobar-folder",));
-        assert!(!dc_delete_file(context, "$BLOBDIR/foobar-folder"));
+        assert!(dc_delete_file(context, "$BLOBDIR/foobar").await);
+        assert!(dc_delete_file(context, "$BLOBDIR/dada").await);
+        assert!(dc_create_folder(context, "$BLOBDIR/foobar-folder")
+            .await
+            .is_ok());
+        assert!(dc_file_exist!(context, "$BLOBDIR/foobar-folder").await);
+        assert!(!dc_delete_file(context, "$BLOBDIR/foobar-folder").await);
 
         let fn0 = "$BLOBDIR/data.data";
-        assert!(dc_write_file(context, &fn0, b"content").is_ok());
+        assert!(dc_write_file(context, &fn0, b"content").await.is_ok());
 
-        assert!(dc_delete_file(context, &fn0));
-        assert!(!dc_file_exist(context, &fn0));
+        assert!(dc_delete_file(context, &fn0).await);
+        assert!(!dc_file_exist!(context, &fn0).await);
     }
 
     #[test]
@@ -853,15 +851,15 @@ mod tests {
         assert!(!listflags_has(listflags, DC_GCL_ADD_SELF));
     }
 
-    #[test]
-    fn test_create_smeared_timestamp() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_create_smeared_timestamp() {
+        let t = dummy_context().await;
         assert_ne!(
-            dc_create_smeared_timestamp(&t.ctx),
-            dc_create_smeared_timestamp(&t.ctx)
+            dc_create_smeared_timestamp(&t.ctx).await,
+            dc_create_smeared_timestamp(&t.ctx).await
         );
         assert!(
-            dc_create_smeared_timestamp(&t.ctx)
+            dc_create_smeared_timestamp(&t.ctx).await
                 >= SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -869,17 +867,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_create_smeared_timestamps() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_create_smeared_timestamps() {
+        let t = dummy_context().await;
         let count = MAX_SECONDS_TO_LEND_FROM_FUTURE - 1;
-        let start = dc_create_smeared_timestamps(&t.ctx, count as usize);
-        let next = dc_smeared_time(&t.ctx);
+        let start = dc_create_smeared_timestamps(&t.ctx, count as usize).await;
+        let next = dc_smeared_time(&t.ctx).await;
         assert!((start + count - 1) < next);
 
         let count = MAX_SECONDS_TO_LEND_FROM_FUTURE + 30;
-        let start = dc_create_smeared_timestamps(&t.ctx, count as usize);
-        let next = dc_smeared_time(&t.ctx);
+        let start = dc_create_smeared_timestamps(&t.ctx, count as usize).await;
+        let next = dc_smeared_time(&t.ctx).await;
         assert!((start + count - 1) < next);
+    }
+
+    #[test]
+    fn test_duration_to_str() {
+        assert_eq!(duration_to_str(Duration::from_secs(0)), "0h 0m 0s");
+        assert_eq!(duration_to_str(Duration::from_secs(59)), "0h 0m 59s");
+        assert_eq!(duration_to_str(Duration::from_secs(60)), "0h 1m 0s");
+        assert_eq!(duration_to_str(Duration::from_secs(61)), "0h 1m 1s");
+        assert_eq!(duration_to_str(Duration::from_secs(59 * 60)), "0h 59m 0s");
+        assert_eq!(
+            duration_to_str(Duration::from_secs(59 * 60 + 59)),
+            "0h 59m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(59 * 60 + 60)),
+            "1h 0m 0s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(2 * 60 * 60 + 59 * 60 + 59)),
+            "2h 59m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(2 * 60 * 60 + 59 * 60 + 60)),
+            "3h 0m 0s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(3 * 60 * 60 + 59)),
+            "3h 0m 59s"
+        );
+        assert_eq!(
+            duration_to_str(Duration::from_secs(3 * 60 * 60 + 60)),
+            "3h 1m 0s"
+        );
     }
 }

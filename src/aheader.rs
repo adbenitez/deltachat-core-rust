@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::{fmt, str};
 
-use crate::constants::*;
 use crate::contact::*;
 use crate::context::Context;
-use crate::key::*;
+use crate::headerdef::{HeaderDef, HeaderDefMap};
+use crate::key::{DcKey, SignedPublicKey};
 
 /// Possible values for encryption preference
 #[derive(PartialEq, Eq, Debug, Clone, Copy, FromPrimitive, ToPrimitive)]
@@ -52,13 +52,17 @@ impl str::FromStr for EncryptPreference {
 #[derive(Debug)]
 pub struct Aheader {
     pub addr: String,
-    pub public_key: Key,
+    pub public_key: SignedPublicKey,
     pub prefer_encrypt: EncryptPreference,
 }
 
 impl Aheader {
     /// Creates new autocrypt header
-    pub fn new(addr: String, public_key: Key, prefer_encrypt: EncryptPreference) -> Self {
+    pub fn new(
+        addr: String,
+        public_key: SignedPublicKey,
+        prefer_encrypt: EncryptPreference,
+    ) -> Self {
         Aheader {
             addr,
             public_key,
@@ -71,9 +75,7 @@ impl Aheader {
         wanted_from: &str,
         headers: &[mailparse::MailHeader<'_>],
     ) -> Option<Self> {
-        use mailparse::MailHeaderMap;
-
-        if let Ok(Some(value)) = headers.get_first_value("Autocrypt") {
+        if let Some(value) = headers.get_header_value(HeaderDef::Autocrypt) {
             match Self::from_str(&value) {
                 Ok(header) => {
                     if addr_cmp(&header.addr, wanted_from) {
@@ -125,14 +127,10 @@ impl str::FromStr for Aheader {
             .split(';')
             .filter_map(|a| {
                 let attribute: Vec<&str> = a.trim().splitn(2, '=').collect();
-                if attribute.len() < 2 {
-                    return None;
+                match &attribute[..] {
+                    [key, value] => Some((key.trim().to_string(), value.trim().to_string())),
+                    _ => None,
                 }
-
-                Some((
-                    attribute[0].trim().to_string(),
-                    attribute[1].trim().to_string(),
-                ))
             })
             .collect();
 
@@ -142,22 +140,11 @@ impl str::FromStr for Aheader {
                 return Err(());
             }
         };
-
-        let public_key = match attributes
+        let public_key: SignedPublicKey = attributes
             .remove("keydata")
-            .and_then(|raw| Key::from_base64(&raw, KeyType::Public))
-        {
-            Some(key) => {
-                if key.verify() {
-                    key
-                } else {
-                    return Err(());
-                }
-            }
-            None => {
-                return Err(());
-            }
-        };
+            .ok_or(())
+            .and_then(|raw| SignedPublicKey::from_base64(&raw).or(Err(())))
+            .and_then(|key| key.verify().and(Ok(key)).or(Err(())))?;
 
         let prefer_encrypt = attributes
             .remove("prefer-encrypt")
@@ -292,7 +279,7 @@ mod tests {
             "{}",
             Aheader::new(
                 "test@example.com".to_string(),
-                Key::from_base64(RAWKEY, KeyType::Public).unwrap(),
+                SignedPublicKey::from_base64(RAWKEY).unwrap(),
                 EncryptPreference::Mutual
             )
         )
@@ -305,7 +292,7 @@ mod tests {
             "{}",
             Aheader::new(
                 "test@example.com".to_string(),
-                Key::from_base64(RAWKEY, KeyType::Public).unwrap(),
+                SignedPublicKey::from_base64(RAWKEY).unwrap(),
                 EncryptPreference::NoPreference
             )
         )

@@ -1,5 +1,230 @@
 # Changelog 
 
+## 1.35.0
+
+- enable strict-tls from a new provider-db setting #1587
+
+- new subject 'Message from USER' for one-to-one chats #1395
+
+- recode images #1563
+
+- improve reconnect handling #1549 #1580
+
+- improve importing addresses #1544
+
+- improve configure and folder detection #1539 #1548
+
+- improve test suite #1559 #1564 #1580 #1581 #1582 #1584 #1588:
+
+- fix ad-hoc groups #1566
+
+- preventions against being marked as spam #1575
+
+- refactorings #1542 #1569
+
+
+## 1.34.0
+
+- new api for io, thread and event handling #1356,
+  see the example atop of `deltachat.h` to get an overview
+
+- LOTS of speed improvements due to async processing #1356
+
+- enable WAL mode for sqlite #1492
+
+- process incoming messages in bulk #1527
+
+- improve finding out the sent-folder #1488
+
+- several bug fixes
+
+
+## 1.33.0
+
+- let `dc_set_muted()` also mute one-to-one chats #1470
+
+- fix a bug that led to load and traffic if the server does not use sent-folder
+  #1472
+
+
+## 1.32.0
+
+- fix endless loop when trying to download messages with bad RFC Message-ID,
+  also be more reliable on similar errors #1463 #1466 #1462
+
+- fix bug with comma in contact request #1438
+
+- do not refer to hidden messages on replies #1459
+
+- improve error handling #1468 #1465 #1464
+
+
+## 1.31.0
+
+- always describe the context of the displayed error #1451
+
+- do not emit `DC_EVENT_ERROR` when message sending fails;
+  `dc_msg_get_state()` and `dc_get_msg_info()` are sufficient #1451
+
+- new config-option `media_quality` #1449
+
+- try over if writing message to database fails #1447
+
+
+## 1.30.0
+
+- expunge deleted messages #1440
+
+- do not send `DC_EVENT_MSGS_CHANGED|INCOMING_MSG` on hidden messages #1439
+
+
+## 1.29.0
+
+- new config options `delete_device_after` and `delete_server_after`,
+  each taking an amount of seconds after which messages
+  are deleted from the device and/or the server #1310 #1335 #1411 #1417 #1423
+
+- new api `dc_estimate_deletion_cnt()` to estimate the effect
+  of `delete_device_after` and `delete_server_after`
+
+- use Ed25519 keys by default, these keys are much shorter
+  than RSA keys, which results in saving traffic and speed improvements #1362
+
+- improve message ellipsizing #1397 #1430
+
+- emit `DC_EVENT_ERROR_NETWORK` also on smtp-errors #1378
+
+- do not show badly formatted non-delta-messages as empty #1384
+
+- try over SMTP on potentially recoverable error 5.5.0 #1379
+
+- remove device-chat from forward-to-chat-list #1367
+
+- improve group-handling #1368
+
+- `dc_get_info()` returns uptime (how long the context is in use)
+
+- python improvements and adaptions #1408 #1415
+
+- log to the stdout and stderr in tests #1416
+
+- refactoring, code improvements #1363 #1365 #1366 #1370 #1375 #1389 #1390 #1418 #1419
+
+- removed api: `dc_chat_get_subtitle()`, `dc_get_version_str()`, `dc_array_add_id()`
+
+- removed events: `DC_EVENT_MEMBER_ADDED`, `DC_EVENT_MEMBER_REMOVED`
+
+
+## 1.28.0
+
+- new flag DC_GCL_FOR_FORWARDING for dc_get_chatlist()
+  that will sort the "saved messages" chat to the top of the chatlist #1336
+- mark mails as being deleted from server in dc_empty_server() #1333
+- fix interaction with servers that do not allow folder creation on root-level;
+  use path separator as defined by the email server #1359
+- fix group creation if group was created by non-delta clients #1357
+- fix showing replies from non-delta clients #1353
+- fix member list on rejoining left groups #1343
+- fix crash when using empty groups #1354
+- fix potential crash on special names #1350
+
+
+## 1.27.0
+
+- handle keys reliably on armv7 #1327
+
+
+## 1.26.0
+
+- change generated key type back to RSA as shipped versions
+  have problems to encrypt to Ed25519 keys
+
+- update rPGP to encrypt reliably to Ed25519 keys;
+  one of the next versions can finally use Ed25519 keys then
+
+
+## 1.25.0
+
+- save traffic by downloading only messages that are really displayed #1236
+
+- change generated key type to Ed25519, these keys are much shorter
+  than RSA keys, which results in saving traffic and speed improvements #1287
+
+- improve key handling #1237 #1240 #1242 #1247
+
+- mute handling, apis are dc_set_chat_mute_duration()
+  dc_chat_is_muted() and dc_chat_get_remaining_mute_duration() #1143
+
+- pinning chats, new apis are dc_set_chat_visibility() and
+  dc_chat_get_visibility() #1248
+
+- add dc_provider_new_from_email() api that queries the new, integrated
+  provider-database #1207
+
+- account creation by scanning a qr code
+  in the DCACCOUNT scheme (https://mailadm.readthedocs.io),
+  new api is dc_set_config_from_qr() #1249
+
+- if possible, dc_join_securejoin(), returns the new chat-id immediately
+  and does the handshake in background #1225
+
+- update imap and smtp dependencies #1115
+
+- check for MOVE capability before using MOVE command #1263
+
+- allow inline attachments from RFC 2183 #1280
+
+- fix updating names from incoming mails #1298
+
+- fix error messages shown on import #1234
+
+- directly attempt to re-connect if the smtp connection is maybe stale #1296
+
+- improve adding group members #1291
+
+- improve rust-api #1261
+
+- cleanup #1302 #1283 #1282 #1276 #1270-#1274 #1267 #1258-#1260
+  #1257 #1239 #1231 #1224
+
+- update spec #1286 #1291
+
+
+## 1.0.0-beta.24
+
+- fix oauth2/gmail bug introduced in beta23 (not used in releases) #1219
+
+- fix panic when receiving eg. cyrillic filenames #1216
+
+- delete all consumed secure-join handshake messagess #1209 #1212
+
+- rust-level cleanups #1218 #1217 #1210 #1205
+
+- python-level cleanups #1204 #1202 #1201
+
+
+## 1.0.0-beta.23
+
+- #1197 fix imap-deletion of messages 
+
+- #1171 Combine multiple MDNs into a single mail, reducing traffic 
+
+- #1155 fix to not send out gossip always, reducing traffic
+
+- #1160 fix reply-to-encrypted determination 
+
+- #1182 Add "Auto-Submitted: auto-replied" header to MDNs
+
+- #1194 produce python wheels again, fix c/py.delta.chat
+  master-deployment 
+
+- rust-level housekeeping and improvements #1161 #1186 #1185 #1190 #1194 #1199 #1191 #1190 #1184 and more
+
+- #1063 clarify licensing 
+
+- #1147 use mailparse 0.10.2 
+
+
 ## 1.0.0-beta.22
 
 - #1095 normalize email lineends to CRLF

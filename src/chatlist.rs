@@ -1,10 +1,11 @@
 //! # Chat list module
 
+use crate::chat;
 use crate::chat::*;
 use crate::constants::*;
 use crate::contact::*;
 use crate::context::*;
-use crate::error::Result;
+use crate::error::{bail, ensure, Result};
 use crate::lot::Lot;
 use crate::message::{Message, MessageState, MsgId};
 use crate::stock::StockMessage;
@@ -36,7 +37,7 @@ use crate::stock::StockMessage;
 #[derive(Debug)]
 pub struct Chatlist {
     /// Stores pairs of `chat_id, message_id`
-    ids: Vec<(u32, MsgId)>,
+    ids: Vec<(ChatId, MsgId)>,
 }
 
 impl Chatlist {
@@ -60,7 +61,7 @@ impl Chatlist {
     ///   or "Not now".
     ///   The UI can also offer a "Close" button that calls dc_marknoticed_contact() then.
     /// - DC_CHAT_ID_ARCHIVED_LINK (6) - this special chat is present if the user has
-    ///   archived *any* chat using dc_archive_chat(). The UI should show a link as
+    ///   archived *any* chat using dc_set_chat_visibility(). The UI should show a link as
     ///   "Show archived chats", if the user clicks this item, the UI should show a
     ///   list of all archived chats that can be created by this function hen using
     ///   the DC_GCL_ARCHIVED_ONLY flag.
@@ -73,6 +74,9 @@ impl Chatlist {
     ///   if DC_GCL_ARCHIVED_ONLY is not set, only unarchived chats are returned and
     ///   the pseudo-chat DC_CHAT_ID_ARCHIVED_LINK is added if there are *any* archived
     ///   chats
+    /// - the flag DC_GCL_FOR_FORWARDING sorts "Saved messages" to the top of the chatlist
+    ///   and hides the device-chat,
+    //    typically used on forwarding, may be combined with DC_GCL_NO_SPECIALS
     /// - if the flag DC_GCL_NO_SPECIALS is set, deaddrop and archive link are not added
     ///   to the list (may be used eg. for selecting chats on forwarding, the flag is
     ///   not needed when DC_GCL_ARCHIVED_ONLY is already set)
@@ -82,16 +86,27 @@ impl Chatlist {
     ///     are returned.
     /// `query_contact_id`: An optional contact ID for filtering the list. Only chats including this contact ID
     ///     are returned.
-    pub fn try_load(
+    pub async fn try_load(
         context: &Context,
         listflags: usize,
         query: Option<&str>,
         query_contact_id: Option<u32>,
     ) -> Result<Self> {
+        let flag_archived_only = 0 != listflags & DC_GCL_ARCHIVED_ONLY;
+        let flag_for_forwarding = 0 != listflags & DC_GCL_FOR_FORWARDING;
+        let flag_no_specials = 0 != listflags & DC_GCL_NO_SPECIALS;
+        let flag_add_alldone_hint = 0 != listflags & DC_GCL_ADD_ALLDONE_HINT;
+
+        // Note that we do not emit DC_EVENT_MSGS_MODIFIED here even if some
+        // messages get deleted to avoid reloading the same chatlist.
+        if let Err(err) = delete_device_expired_messages(context).await {
+            warn!(context, "Failed to hide expired messages: {}", err);
+        }
+
         let mut add_archived_link_item = false;
 
         let process_row = |row: &rusqlite::Row| {
-            let chat_id: u32 = row.get(0)?;
+            let chat_id: ChatId = row.get(0)?;
             let msg_id: MsgId = row.get(1).unwrap_or_default();
             Ok((chat_id, msg_id))
         };
@@ -99,6 +114,15 @@ impl Chatlist {
         let process_rows = |rows: rusqlite::MappedRows<_>| {
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Into::into)
+        };
+
+        let skip_id = if flag_for_forwarding {
+            chat::lookup_by_contact_id(context, DC_CONTACT_ID_DEVICE)
+                .await
+                .unwrap_or_default()
+                .0
+        } else {
+            ChatId::new(0)
         };
 
         // select with left join and minimum:
@@ -127,20 +151,25 @@ impl Chatlist {
                                SELECT MAX(timestamp)
                                  FROM msgs
                                 WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?))
+                                  AND (hidden=0 OR state=?1))
                  WHERE c.id>9
                    AND c.blocked=0
-                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?)
+                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2)
                  GROUP BY c.id
-                 ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                params![MessageState::OutDraft, query_contact_id as i32],
+                 ORDER BY c.archived=?3 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
+                paramsv![MessageState::OutDraft, query_contact_id as i32, ChatVisibility::Pinned],
                 process_row,
                 process_rows,
-            )?
-        } else if 0 != listflags & DC_GCL_ARCHIVED_ONLY {
+            ).await?
+        } else if flag_archived_only {
             // show archived chats
-            context.sql.query_map(
-                "SELECT c.id, m.id
+            // (this includes the archived device-chat; we could skip it,
+            // however, then the number of archived chats do not match, which might be even more irritating.
+            // and adapting the number requires larger refactorings and seems not to be worth the effort)
+            context
+                .sql
+                .query_map(
+                    "SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
                         ON c.id=m.chat_id
@@ -154,17 +183,26 @@ impl Chatlist {
                    AND c.archived=1
                  GROUP BY c.id
                  ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                params![MessageState::OutDraft],
-                process_row,
-                process_rows,
-            )?
+                    paramsv![MessageState::OutDraft],
+                    process_row,
+                    process_rows,
+                )
+                .await?
         } else if let Some(query) = query {
             let query = query.trim().to_string();
             ensure!(!query.is_empty(), "missing query");
 
+            // allow searching over special names that may change at any time
+            // when the ui calls set_stock_translation()
+            if let Err(err) = update_special_chat_names(context).await {
+                warn!(context, "cannot update special chat names: {:?}", err)
+            }
+
             let str_like_cmd = format!("%{}%", query);
-            context.sql.query_map(
-                "SELECT c.id, m.id
+            context
+                .sql
+                .query_map(
+                    "SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
                         ON c.id=m.chat_id
@@ -172,18 +210,27 @@ impl Chatlist {
                                SELECT MAX(timestamp)
                                  FROM msgs
                                 WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?))
-                 WHERE c.id>9
+                                  AND (hidden=0 OR state=?1))
+                 WHERE c.id>9 AND c.id!=?2
                    AND c.blocked=0
-                   AND c.name LIKE ?
+                   AND c.name LIKE ?3
                  GROUP BY c.id
                  ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                params![MessageState::OutDraft, str_like_cmd],
-                process_row,
-                process_rows,
-            )?
+                    paramsv![MessageState::OutDraft, skip_id, str_like_cmd],
+                    process_row,
+                    process_rows,
+                )
+                .await?
         } else {
             //  show normal chatlist
+            let sort_id_up = if flag_for_forwarding {
+                chat::lookup_by_contact_id(context, DC_CONTACT_ID_SELF)
+                    .await
+                    .unwrap_or_default()
+                    .0
+            } else {
+                ChatId::new(0)
+            };
             let mut ids = context.sql.query_map(
                 "SELECT c.id, m.id
                  FROM chats c
@@ -193,30 +240,36 @@ impl Chatlist {
                                SELECT MAX(timestamp)
                                  FROM msgs
                                 WHERE chat_id=c.id
-                                  AND (hidden=0 OR state=?))
-                 WHERE c.id>9
+                                  AND (hidden=0 OR state=?1))
+                 WHERE c.id>9 AND c.id!=?2
                    AND c.blocked=0
-                   AND c.archived=0
+                   AND NOT c.archived=?3
                  GROUP BY c.id
-                 ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                params![MessageState::OutDraft],
+                 ORDER BY c.id=?4 DESC, c.archived=?5 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
+                paramsv![MessageState::OutDraft, skip_id, ChatVisibility::Archived, sort_id_up, ChatVisibility::Pinned],
                 process_row,
                 process_rows,
-            )?;
-            if 0 == listflags & DC_GCL_NO_SPECIALS {
-                if let Some(last_deaddrop_fresh_msg_id) = get_last_deaddrop_fresh_msg(context) {
-                    ids.insert(0, (DC_CHAT_ID_DEADDROP, last_deaddrop_fresh_msg_id));
+            ).await?;
+            if !flag_no_specials {
+                if let Some(last_deaddrop_fresh_msg_id) = get_last_deaddrop_fresh_msg(context).await
+                {
+                    if !flag_for_forwarding {
+                        ids.insert(
+                            0,
+                            (ChatId::new(DC_CHAT_ID_DEADDROP), last_deaddrop_fresh_msg_id),
+                        );
+                    }
                 }
                 add_archived_link_item = true;
             }
             ids
         };
 
-        if add_archived_link_item && dc_get_archived_cnt(context) > 0 {
-            if ids.is_empty() && 0 != listflags & DC_GCL_ADD_ALLDONE_HINT {
-                ids.push((DC_CHAT_ID_ALLDONE_HINT, MsgId::new(0)));
+        if add_archived_link_item && dc_get_archived_cnt(context).await > 0 {
+            if ids.is_empty() && flag_add_alldone_hint {
+                ids.push((ChatId::new(DC_CHAT_ID_ALLDONE_HINT), MsgId::new(0)));
             }
-            ids.push((DC_CHAT_ID_ARCHIVED_LINK, MsgId::new(0)));
+            ids.push((ChatId::new(DC_CHAT_ID_ARCHIVED_LINK), MsgId::new(0)));
         }
 
         Ok(Chatlist { ids })
@@ -235,19 +288,21 @@ impl Chatlist {
     /// Get a single chat ID of a chatlist.
     ///
     /// To get the message object from the message ID, use dc_get_chat().
-    pub fn get_chat_id(&self, index: usize) -> u32 {
-        if index >= self.ids.len() {
-            return 0;
+    pub fn get_chat_id(&self, index: usize) -> ChatId {
+        match self.ids.get(index) {
+            Some((chat_id, _msg_id)) => *chat_id,
+            None => ChatId::new(0),
         }
-        self.ids[index].0
     }
 
     /// Get a single message ID of a chatlist.
     ///
     /// To get the message object from the message ID, use dc_get_msg().
     pub fn get_msg_id(&self, index: usize) -> Result<MsgId> {
-        ensure!(index < self.ids.len(), "Chatlist index out of range");
-        Ok(self.ids[index].1)
+        match self.ids.get(index) {
+            Some((_chat_id, msg_id)) => Ok(*msg_id),
+            None => bail!("Chatlist index out of range"),
+        }
     }
 
     /// Get a summary for a chatlist index.
@@ -264,36 +319,38 @@ impl Chatlist {
     /// - dc_lot_t::timestamp: the timestamp of the message.  0 if not applicable.
     /// - dc_lot_t::state: The state of the message as one of the DC_STATE_* constants (see #dc_msg_get_state()).
     //    0 if not applicable.
-    pub fn get_summary(&self, context: &Context, index: usize, chat: Option<&Chat>) -> Lot {
+    pub async fn get_summary(&self, context: &Context, index: usize, chat: Option<&Chat>) -> Lot {
         // The summary is created by the chat, not by the last message.
         // This is because we may want to display drafts here or stuff as
         // "is typing".
         // Also, sth. as "No messages" would not work if the summary comes from a message.
-
         let mut ret = Lot::new();
-        if index >= self.ids.len() {
-            ret.text2 = Some("ErrBadChatlistIndex".to_string());
-            return ret;
-        }
+
+        let (chat_id, lastmsg_id) = match self.ids.get(index) {
+            Some(ids) => ids,
+            None => {
+                ret.text2 = Some("ErrBadChatlistIndex".to_string());
+                return ret;
+            }
+        };
 
         let chat_loaded: Chat;
         let chat = if let Some(chat) = chat {
             chat
-        } else if let Ok(chat) = Chat::load_from_db(context, self.ids[index].0) {
+        } else if let Ok(chat) = Chat::load_from_db(context, *chat_id).await {
             chat_loaded = chat;
             &chat_loaded
         } else {
             return ret;
         };
 
-        let lastmsg_id = self.ids[index].1;
         let mut lastcontact = None;
 
-        let lastmsg = if let Ok(lastmsg) = Message::load_from_db(context, lastmsg_id) {
+        let lastmsg = if let Ok(lastmsg) = Message::load_from_db(context, *lastmsg_id).await {
             if lastmsg.from_id != DC_CONTACT_ID_SELF
                 && (chat.typ == Chattype::Group || chat.typ == Chattype::VerifiedGroup)
             {
-                lastcontact = Contact::load_from_db(context, lastmsg.from_id).ok();
+                lastcontact = Contact::load_from_db(context, lastmsg.from_id).await.ok();
             }
 
             Some(lastmsg)
@@ -301,66 +358,85 @@ impl Chatlist {
             None
         };
 
-        if chat.id == DC_CHAT_ID_ARCHIVED_LINK {
+        if chat.id.is_archived_link() {
             ret.text2 = None;
         } else if lastmsg.is_none() || lastmsg.as_ref().unwrap().from_id == DC_CONTACT_ID_UNDEFINED
         {
-            ret.text2 = Some(context.stock_str(StockMessage::NoMessages).to_string());
+            ret.text2 = Some(
+                context
+                    .stock_str(StockMessage::NoMessages)
+                    .await
+                    .to_string(),
+            );
         } else {
-            ret.fill(&mut lastmsg.unwrap(), chat, lastcontact.as_ref(), context);
+            ret.fill(&mut lastmsg.unwrap(), chat, lastcontact.as_ref(), context)
+                .await;
         }
 
         ret
     }
+
+    pub fn get_index_for_id(&self, id: ChatId) -> Option<usize> {
+        self.ids.iter().position(|(chat_id, _)| chat_id == &id)
+    }
 }
 
 /// Returns the number of archived chats
-pub fn dc_get_archived_cnt(context: &Context) -> u32 {
+pub async fn dc_get_archived_cnt(context: &Context) -> u32 {
     context
         .sql
         .query_get_value(
             context,
             "SELECT COUNT(*) FROM chats WHERE blocked=0 AND archived=1;",
-            params![],
+            paramsv![],
         )
+        .await
         .unwrap_or_default()
 }
 
-fn get_last_deaddrop_fresh_msg(context: &Context) -> Option<MsgId> {
+async fn get_last_deaddrop_fresh_msg(context: &Context) -> Option<MsgId> {
     // We have an index over the state-column, this should be
     // sufficient as there are typically only few fresh messages.
-    context.sql.query_get_value(
-        context,
-        concat!(
-            "SELECT m.id",
-            " FROM msgs m",
-            " LEFT JOIN chats c",
-            "        ON c.id=m.chat_id",
-            " WHERE m.state=10",
-            "   AND m.hidden=0",
-            "   AND c.blocked=2",
-            " ORDER BY m.timestamp DESC, m.id DESC;"
-        ),
-        params![],
-    )
+    context
+        .sql
+        .query_get_value(
+            context,
+            concat!(
+                "SELECT m.id",
+                " FROM msgs m",
+                " LEFT JOIN chats c",
+                "        ON c.id=m.chat_id",
+                " WHERE m.state=10",
+                "   AND m.hidden=0",
+                "   AND c.blocked=2",
+                " ORDER BY m.timestamp DESC, m.id DESC;"
+            ),
+            paramsv![],
+        )
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::chat;
     use crate::test_utils::*;
 
-    #[test]
-    fn test_try_load() {
-        let t = dummy_context();
-        let chat_id1 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "a chat").unwrap();
-        let chat_id2 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "b chat").unwrap();
-        let chat_id3 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "c chat").unwrap();
+    #[async_std::test]
+    async fn test_try_load() {
+        let t = dummy_context().await;
+        let chat_id1 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "a chat")
+            .await
+            .unwrap();
+        let chat_id2 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "b chat")
+            .await
+            .unwrap();
+        let chat_id3 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "c chat")
+            .await
+            .unwrap();
 
         // check that the chatlist starts with the most recent message
-        let chats = Chatlist::try_load(&t.ctx, 0, None, None).unwrap();
+        let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 3);
         assert_eq!(chats.get_chat_id(0), chat_id3);
         assert_eq!(chats.get_chat_id(1), chat_id2);
@@ -369,19 +445,102 @@ mod tests {
         // drafts are sorted to the top
         let mut msg = Message::new(Viewtype::Text);
         msg.set_text(Some("hello".to_string()));
-        set_draft(&t.ctx, chat_id2, Some(&mut msg));
-        let chats = Chatlist::try_load(&t.ctx, 0, None, None).unwrap();
+        chat_id2.set_draft(&t.ctx, Some(&mut msg)).await;
+        let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
         assert_eq!(chats.get_chat_id(0), chat_id2);
 
         // check chatlist query and archive functionality
-        let chats = Chatlist::try_load(&t.ctx, 0, Some("b"), None).unwrap();
+        let chats = Chatlist::try_load(&t.ctx, 0, Some("b"), None)
+            .await
+            .unwrap();
         assert_eq!(chats.len(), 1);
 
-        let chats = Chatlist::try_load(&t.ctx, DC_GCL_ARCHIVED_ONLY, None, None).unwrap();
+        let chats = Chatlist::try_load(&t.ctx, DC_GCL_ARCHIVED_ONLY, None, None)
+            .await
+            .unwrap();
         assert_eq!(chats.len(), 0);
 
-        chat::archive(&t.ctx, chat_id1, true).ok();
-        let chats = Chatlist::try_load(&t.ctx, DC_GCL_ARCHIVED_ONLY, None, None).unwrap();
+        chat_id1
+            .set_visibility(&t.ctx, ChatVisibility::Archived)
+            .await
+            .ok();
+        let chats = Chatlist::try_load(&t.ctx, DC_GCL_ARCHIVED_ONLY, None, None)
+            .await
+            .unwrap();
         assert_eq!(chats.len(), 1);
+    }
+
+    #[async_std::test]
+    async fn test_sort_self_talk_up_on_forward() {
+        let t = dummy_context().await;
+        t.ctx.update_device_chats().await.unwrap();
+        create_group_chat(&t.ctx, VerifiedStatus::Unverified, "a chat")
+            .await
+            .unwrap();
+
+        let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
+        assert!(chats.len() == 3);
+        assert!(!Chat::load_from_db(&t.ctx, chats.get_chat_id(0))
+            .await
+            .unwrap()
+            .is_self_talk());
+
+        let chats = Chatlist::try_load(&t.ctx, DC_GCL_FOR_FORWARDING, None, None)
+            .await
+            .unwrap();
+        assert!(chats.len() == 2); // device chat cannot be written and is skipped on forwarding
+        assert!(Chat::load_from_db(&t.ctx, chats.get_chat_id(0))
+            .await
+            .unwrap()
+            .is_self_talk());
+    }
+
+    #[async_std::test]
+    async fn test_search_special_chat_names() {
+        let t = dummy_context().await;
+        t.ctx.update_device_chats().await.unwrap();
+
+        let chats = Chatlist::try_load(&t.ctx, 0, Some("t-1234-s"), None)
+            .await
+            .unwrap();
+        assert_eq!(chats.len(), 0);
+        let chats = Chatlist::try_load(&t.ctx, 0, Some("t-5678-b"), None)
+            .await
+            .unwrap();
+        assert_eq!(chats.len(), 0);
+
+        t.ctx
+            .set_stock_translation(StockMessage::SavedMessages, "test-1234-save".to_string())
+            .await
+            .unwrap();
+        let chats = Chatlist::try_load(&t.ctx, 0, Some("t-1234-s"), None)
+            .await
+            .unwrap();
+        assert_eq!(chats.len(), 1);
+
+        t.ctx
+            .set_stock_translation(StockMessage::DeviceMessages, "test-5678-babbel".to_string())
+            .await
+            .unwrap();
+        let chats = Chatlist::try_load(&t.ctx, 0, Some("t-5678-b"), None)
+            .await
+            .unwrap();
+        assert_eq!(chats.len(), 1);
+    }
+
+    #[async_std::test]
+    async fn test_get_summary_unwrap() {
+        let t = dummy_context().await;
+        let chat_id1 = create_group_chat(&t.ctx, VerifiedStatus::Unverified, "a chat")
+            .await
+            .unwrap();
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("foo:\nbar \r\n test".to_string()));
+        chat_id1.set_draft(&t.ctx, Some(&mut msg)).await;
+
+        let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
+        let summary = chats.get_summary(&t.ctx, 0, None).await;
+        assert_eq!(summary.get_text2().unwrap(), "foo: bar test"); // the linebreak should be removed from summary
     }
 }

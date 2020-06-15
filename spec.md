@@ -1,10 +1,12 @@
-# Chat-over-Email specification
+# chat-mail specification
 
-Version 0.20.0
+Version: 0.32.0
+Status:  In-progress 
+Format:  [Semantic Line Breaks](https://sembr.org/)
 
-This document describes how emails can be used
-to implement typical messenger functions
-while staying compatible to existing MUAs.
+This document roughly describes how chat-mail 
+apps use the standard e-mail system 
+to implement typical messenger functions.
 
 - [Encryption](#encryption)
 - [Outgoing messages](#outgoing-messages)
@@ -17,6 +19,9 @@ while staying compatible to existing MUAs.
     - [Change group name](#change-group-name)
     - [Set group image](#set-group-image)
 - [Set profile image](#set-profile-image)
+- [Locations](#locations)
+    - [User locations](#user-locations)
+    - [Points of interest](#points-of-interest)
 - [Miscellaneous](#miscellaneous)
 
 
@@ -27,18 +32,14 @@ Messages SHOULD be encrypted by the
 `prefer-encrypt=mutual` MAY be set by default.
 
 Meta data (at least the subject and all chat-headers) SHOULD be encrypted
-by the [Memoryhole](https://github.com/autocrypt/memoryhole) standard.
-If Memoryhole is not used,
-the subject of encrypted messages SHOULD be replaced by the string
-`Chat: Encrypted message` where the part after the colon MAY be localized.
+by the [Protected Headers](https://www.ietf.org/id/draft-autocrypt-lamps-protected-headers-02.html) standard.
 
 
 # Outgoing messages
 
 Messengers MUST add a `Chat-Version: 1.0` header to outgoing messages.
 For filtering and smart appearance of the messages in normal MUAs,
-the `Subject` header SHOULD start with the characters `Chat:`
-and SHOULD be an excerpt of the message.
+the `Subject` header SHOULD be `Message from <sender name>`.
 Replies to messages MAY follow the typical `Re:`-format.
 
 The body MAY contain text which MUST have the content type `text/plain`
@@ -56,7 +57,7 @@ Full quotes, footers or sth. like that MUST NOT go to the user-text-part.
     To: rcpt@domain
     Chat-Version: 1.0
     Content-Type: text/plain
-    Subject: Chat: Hello ...
+    Subject: Message from sender@domain
 
     Hello world!
 
@@ -113,6 +114,7 @@ but MUAs typically expose the sender in the UI.
 Groups are chats with usually more than one recipient,
 each defined by an email-address.
 The sender plus the recipients are the group members.
+All group members form the member list.
 
 To allow different groups with the same members,
 groups are identified by a group-id.
@@ -135,8 +137,7 @@ The group-name MUST be written to `Chat-Group-Name` header
 to join a group chat on a second device any time).
 
 The `Subject` header of outgoing group messages
-SHOULD start with the characters `Chat:`
-followed by the group-name and a colon followed by an excerpt of the message.
+SHOULD be set to the group-name.
 
 To identify the group-id on replies from normal MUAs,
 the group-id MUST also be added to the message-id of outgoing messages.
@@ -153,8 +154,8 @@ The message-id MUST have the format `Gr.<group-id>.<unique data>`.
     Hello group - this group contains three members
 
 Messengers adding the member list in the form `Name <email-address>`
-MUST take care only to spread the names authorized by the contacts themselves.
-Otherwise, names as _Daddy_ or _Honey_ may be spread
+MUST take care only to distribute the names authorized by the contacts themselves.
+Otherwise, names as _Daddy_ or _Honey_ may be distributed
 (this issue is also true for normal MUAs, however,
 for more contact- and chat-centralized apps
 such situations happen more frequently).
@@ -177,12 +178,22 @@ to a normal single-user chat with the email-address given in `From`.
 
 ## Add and remove members
 
-Messenger clients MUST construct the member list
-from the `From`/`To` headers only on the first group message
-or if they see a `Chat-Group-Member-Added`
-or `Chat-Group-Member-Removed` action header.
-Both headers MUST have the email-address
-of the added or removed member as the value.
+Messenger clients MUST init the member list
+from the `From`/`To` headers on the first group message.
+
+When a member is added later,
+a `Chat-Group-Member-Added` action header must be sent
+with the value set to the email-address of the added member.
+When receiving a `Chat-Group-Member-Added` header, however,
+_all missing_ members  the `From`/`To` headers has to be added.
+This is to mitigate problems when receiving messages
+in different orders, esp. on creating new groups.
+
+To remove a member, a `Chat-Group-Member-Removed` header must be sent
+with the value set to the email-address of the member to remove.
+When receiving a `Chat-Group-Member-Removed` header,
+only exaxtly the given member has to be removed from the member list.
+
 Messenger clients MUST NOT construct the member list
 on other group messages
 (this is to avoid accidentally altered To-lists in normal MUAs;
@@ -288,7 +299,7 @@ to add a `Chat-Group-Avatar` only on image changes.
 
 # Set profile image
 
-A user MAY have a profile-image that MAY be spread to their contacts.
+A user MAY have a profile-image that MAY be distributed to their contacts.
 To change or set the profile-image,
 the messenger MUST attach an image file to a message
 and MUST add the header `Chat-User-Avatar`
@@ -297,7 +308,7 @@ with the value set to the image name.
 To remove the profile-image,
 the messenger MUST add the header `Chat-User-Avatar: 0`.
 
-To spread the image,
+To distribute the image,
 the messenger MAY send the profile image
 together with the next mail to a given contact
 (to do this only once,
@@ -330,6 +341,64 @@ eg. there may be a `Chat-User-Avatar` and a `Chat-Group-Avatar` header
 in the same message.
 To save data, it is RECOMMENDED to add a `Chat-User-Avatar` header
 only on image changes.
+
+
+# Locations
+
+Locations can be attachted to messages using
+[standard kml-files](https://www.opengeospatial.org/standards/kml/)
+with well-known names.
+
+
+## User locations
+
+To send the location of the sender,
+the app can attach a file with the name `location.kml`.
+The file can contain one or more locations.
+Apps that support location streaming will typically collect some location events
+and send them together in one file.
+As each location has an independent timestamp,
+the apps can show the location as a track.
+
+Note that the `addr` attribute inside the  `location.kml` file
+MUST match the users email-address.
+Otherwise, the file is discarded silently;
+this is to protect against getting wrong locations,
+eg. forwarded from a normal MUA.
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2">
+      <Document addr="ndh@deltachat.de">
+        <Placemark>
+          <Timestamp><when>2020-01-11T20:40:19Z</when></Timestamp>
+          <Point><coordinates accuracy="1.2">1.234,5.678</coordinates></Point>
+        </Placemark>
+        <Placemark>
+          <Timestamp><when>2020-01-11T20:40:25Z</when></Timestamp>
+          <Point><coordinates accuracy="5.4">7.654,3.21</coordinates></Point>
+        </Placemark>
+      </Document>
+    </kml>
+
+
+## Points of interest
+
+To send an "Point of interest", a POI,
+use a normal message and attach a file with the name  `message.kml`.
+In contrast to user locations, this file should contain only one location
+and an address-attribute is not needed -
+as the location belongs to the message content,
+it is fine if the location is detected on forwarding etc.
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2">
+      <Document>
+        <Placemark>
+          <Timestamp><when>2020-01-01T20:40:19Z</when></Timestamp>
+          <Point><coordinates accuracy="1.2">1.234,5.678</coordinates></Point>
+        </Placemark>
+      </Document>
+    </kml>
 
 
 # Miscellaneous
@@ -368,4 +437,4 @@ as the sending time of the message as indicated by its Date header,
 or the time of first receipt if that date is in the future or unavailable.
 
 
-Copyright © 2017-2019 Delta Chat contributors.
+Copyright © 2017-2020 Delta Chat contributors.

@@ -13,14 +13,20 @@ def main():
             "root": "..",
             "relative_to": __file__,
             'tag_regex': r'^(?P<prefix>py-)?(?P<version>[^\+]+)(?P<suffix>.*)?$',
+            'git_describe_command': "git describe --dirty --tags --long --match py-*.*",
         },
         description='Python bindings for the Delta Chat Core library using CFFI against the Rust-implemented libdeltachat',
         long_description=long_description,
         author='holger krekel, Floris Bruynooghe, Bjoern Petersen and contributors',
-        install_requires=['cffi>=1.0.0', 'six'],
+        install_requires=['cffi>=1.0.0', 'pluggy', 'imapclient'],
         packages=setuptools.find_packages('src'),
         package_dir={'': 'src'},
         cffi_modules=['src/deltachat/_build.py:ffibuilder'],
+        entry_points = {
+            'pytest11': [
+                'deltachat.testplugin = deltachat.testplugin',
+            ],
+        },
         classifiers=[
             'Development Status :: 4 - Beta',
             'Intended Audience :: Developers',

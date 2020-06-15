@@ -1,5 +1,28 @@
-0.600.1
+0.900.0 (DRAFT)
+---------------
+
+- refactored internals to use plugin-approach 
+
+- introduced PerAccount and Global hooks that plugins can implement 
+
+- introduced `ac_member_added()` and `ac_member_removed()` plugin events. 
+
+- introduced two documented examples for an echo and a group-membership
+  tracking plugin. 
+
+0.800.0
+-------
+
+- use latest core 1.25.0 
+
+- refine tests and some internal changes to core bindings
+
+0.700.0
 ---------
+
+- lots of new Python APIs
+
+- use rust core-beta23 
 
 - introduce automatic versioning via setuptools_scm, 
   based on py-X.Y.Z tags 

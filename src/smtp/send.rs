@@ -8,15 +8,15 @@ use crate::events::Event;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "Envelope error: {}", _0)]
-    EnvelopeError(#[cause] async_smtp::error::Error),
+    #[error("Envelope error: {}", _0)]
+    EnvelopeError(#[from] async_smtp::error::Error),
 
-    #[fail(display = "Send error: {}", _0)]
-    SendError(#[cause] async_smtp::smtp::error::Error),
+    #[error("Send error: {}", _0)]
+    SendError(#[from] async_smtp::smtp::error::Error),
 
-    #[fail(display = "SMTP has no transport")]
+    #[error("SMTP has no transport")]
     NoTransport,
 }
 
@@ -49,10 +49,12 @@ impl Smtp {
         if let Some(ref mut transport) = self.transport {
             transport.send(mail).await.map_err(Error::SendError)?;
 
-            context.call_cb(Event::SmtpMessageSent(format!(
+            context.emit_event(Event::SmtpMessageSent(format!(
                 "Message len={} was smtp-sent to {}",
                 message_len, recipients_display
             )));
+            self.last_success = Some(std::time::Instant::now());
+
             Ok(())
         } else {
             warn!(

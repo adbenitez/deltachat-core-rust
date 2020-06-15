@@ -1,24 +1,24 @@
 """ Account class implementation. """
 
 from __future__ import print_function
-import atexit
-import threading
+from contextlib import contextmanager
+from email.utils import parseaddr
+from threading import Event
 import os
-import re
-import time
 from array import array
-try:
-    from queue import Queue, Empty
-except ImportError:
-    from Queue import Queue, Empty
-
-import deltachat
 from . import const
 from .capi import ffi, lib
 from .cutil import as_dc_charpointer, from_dc_charpointer, iter_array, DCLot
 from .chat import Chat
 from .message import Message
 from .contact import Contact
+from .tracker import ImexTracker, ConfigureTracker
+from . import hookspec
+from .events import EventThread
+
+
+class MissingCredentials(ValueError):
+    """ Account is missing `addr` and `mail_pw` config values. """
 
 
 class Account(object):
@@ -26,38 +26,52 @@ class Account(object):
     by the underlying deltachat core library.  All public Account methods are
     meant to be memory-safe and return memory-safe objects.
     """
-    def __init__(self, db_path, logid=None, eventlogging=True, os_name=None, debug=True):
+    MissingCredentials = MissingCredentials
+
+    def __init__(self, db_path, os_name=None, logging=True):
         """ initialize account object.
 
         :param db_path: a path to the account database. The database
                         will be created if it doesn't exist.
-        :param logid: an optional logging prefix that should be used with
-                      the default internal logging.
-        :param eventlogging: if False no eventlogging and no context callback will be configured
         :param os_name: this will be put to the X-Mailer header in outgoing messages
-        :param debug: turn on debug logging for events.
         """
-        self._dc_context = ffi.gc(
-            lib.dc_context_new(lib.py_dc_callback, ffi.NULL, as_dc_charpointer(os_name)),
-            _destroy_dc_context,
-        )
-        if eventlogging:
-            self._evlogger = EventLogger(self._dc_context, logid, debug)
-            deltachat.set_context_callback(self._dc_context, self._process_event)
-            self._threads = IOThreads(self._dc_context, self._evlogger._log_event)
-        else:
-            self._threads = IOThreads(self._dc_context)
+        # initialize per-account plugin system
+        self._pm = hookspec.PerAccount._make_plugin_manager()
+        self._logging = logging
 
+        self.add_account_plugin(self)
+
+        self.db_path = db_path
         if hasattr(db_path, "encode"):
             db_path = db_path.encode("utf8")
-        if not lib.dc_open(self._dc_context, db_path, ffi.NULL):
-            raise ValueError("Could not dc_open: {}".format(db_path))
+
+        self._dc_context = ffi.gc(
+            lib.dc_context_new(as_dc_charpointer(os_name), db_path, ffi.NULL),
+            lib.dc_context_unref,
+        )
+        if self._dc_context == ffi.NULL:
+            raise ValueError("Could not dc_context_new: {} {}".format(os_name, db_path))
+
+        self._shutdown_event = Event()
+        self._event_thread = EventThread(self)
         self._configkeys = self.get_config("sys.config_keys").split()
-        self._imex_events = Queue()
-        atexit.register(self.shutdown)
+        hook = hookspec.Global._get_plugin_manager().hook
+        hook.dc_account_init(account=self)
+
+    def disable_logging(self):
+        """ disable logging. """
+        self._logging = False
+
+    def enable_logging(self):
+        """ re-enable logging. """
+        self._logging = True
 
     # def __del__(self):
     #    self.shutdown()
+
+    def log(self, msg):
+        if self._logging:
+            self._pm.hook.ac_log_line(message=msg)
 
     def _check_config_key(self, name):
         if name not in self._configkeys:
@@ -118,16 +132,27 @@ class Account(object):
         assert res != ffi.NULL, "config value not found for: {!r}".format(name)
         return from_dc_charpointer(res)
 
-    def configure(self, **kwargs):
-        """ set config values and configure this account.
+    def _preconfigure_keypair(self, addr, public, secret):
+        """See dc_preconfigure_keypair() in deltachat.h.
+
+        In other words, you don't need this.
+        """
+        res = lib.dc_preconfigure_keypair(self._dc_context,
+                                          as_dc_charpointer(addr),
+                                          as_dc_charpointer(public),
+                                          as_dc_charpointer(secret))
+        if res == 0:
+            raise Exception("Failed to set key")
+
+    def update_config(self, kwargs):
+        """ update config values.
 
         :param kwargs: name=value config settings for this account.
                        values need to be unicode.
         :returns: None
         """
-        for name, value in kwargs.items():
-            self.set_config(name, value)
-        lib.dc_configure(self._dc_context)
+        for key, value in kwargs.items():
+            self.set_config(key, str(value))
 
     def is_configured(self):
         """ determine if the account is configured already; an initial connection
@@ -135,7 +160,7 @@ class Account(object):
 
         :returns: True if account is configured.
         """
-        return lib.dc_is_configured(self._dc_context)
+        return True if lib.dc_is_configured(self._dc_context) else False
 
     def set_avatar(self, img_path):
         """Set self avatar.
@@ -165,11 +190,6 @@ class Account(object):
             raise ValueError("no flags set")
         lib.dc_empty_server(self._dc_context, flags)
 
-    def get_infostring(self):
-        """ return info of the configured account. """
-        self.check_is_configured()
-        return from_dc_charpointer(lib.dc_get_info(self._dc_context))
-
     def get_latest_backupfile(self, backupdir):
         """ return the latest backup file in a given directory.
         """
@@ -191,23 +211,43 @@ class Account(object):
 
         :returns: :class:`deltachat.contact.Contact`
         """
-        self.check_is_configured()
-        return Contact(self._dc_context, const.DC_CONTACT_ID_SELF)
+        return Contact(self, const.DC_CONTACT_ID_SELF)
 
-    def create_contact(self, email, name=None):
-        """ create a (new) Contact. If there already is a Contact
-        with that e-mail address, it is unblocked and its name is
-        updated.
+    def create_contact(self, obj, name=None):
+        """ create a (new) Contact or return an existing one.
 
-        :param email: email-address (text type)
-        :param name: display name for this contact (optional)
+        Calling this method will always resulut in the same
+        underlying contact id.  If there already is a Contact
+        with that e-mail address, it is unblocked and its display
+        `name` is updated if specified.
+
+        :param obj: email-address, Account or Contact instance.
+        :param name: (optional) display name for this contact
         :returns: :class:`deltachat.contact.Contact` instance.
         """
+        if isinstance(obj, Account):
+            if not obj.is_configured():
+                raise ValueError("can only add addresses from configured accounts")
+            addr, displayname = obj.get_config("addr"), obj.get_config("displayname")
+        elif isinstance(obj, Contact):
+            if obj.account != self:
+                raise ValueError("account mismatch {}".format(obj))
+            addr, displayname = obj.addr, obj.name
+        elif isinstance(obj, str):
+            displayname, addr = parseaddr(obj)
+        else:
+            raise TypeError("don't know how to create chat for %r" % (obj, ))
+
+        if name is None and displayname:
+            name = displayname
+        return self._create_contact(addr, name)
+
+    def _create_contact(self, addr, name):
+        addr = as_dc_charpointer(addr)
         name = as_dc_charpointer(name)
-        email = as_dc_charpointer(email)
-        contact_id = lib.dc_create_contact(self._dc_context, name, email)
-        assert contact_id > const.DC_CHAT_ID_LAST_SPECIAL
-        return Contact(self._dc_context, contact_id)
+        contact_id = lib.dc_create_contact(self._dc_context, name, addr)
+        assert contact_id > const.DC_CHAT_ID_LAST_SPECIAL, contact_id
+        return Contact(self, contact_id)
 
     def delete_contact(self, contact):
         """ delete a Contact.
@@ -216,9 +256,24 @@ class Account(object):
         :returns: True if deletion succeeded (contact was deleted)
         """
         contact_id = contact.id
-        assert contact._dc_context == self._dc_context
+        assert contact.account == self
         assert contact_id > const.DC_CHAT_ID_LAST_SPECIAL
         return bool(lib.dc_delete_contact(self._dc_context, contact_id))
+
+    def get_contact_by_addr(self, email):
+        """ get a contact for the email address or None if it's blocked or doesn't exist. """
+        _, addr = parseaddr(email)
+        addr = as_dc_charpointer(addr)
+        contact_id = lib.dc_lookup_contact_id_by_addr(self._dc_context, addr)
+        if contact_id:
+            return self.get_contact_by_id(contact_id)
+
+    def get_contact_by_id(self, contact_id):
+        """ return Contact instance or None.
+        :param contact_id: integer id of this contact.
+        :returns: None or :class:`deltachat.contact.Contact` instance.
+        """
+        return Contact(self, contact_id)
 
     def get_contacts(self, query=None, with_self=False, only_verified=False):
         """ get a (filtered) list of contacts.
@@ -239,52 +294,39 @@ class Account(object):
             lib.dc_get_contacts(self._dc_context, flags, query),
             lib.dc_array_unref
         )
-        return list(iter_array(dc_array, lambda x: Contact(self._dc_context, x)))
+        return list(iter_array(dc_array, lambda x: Contact(self, x)))
 
-    def create_chat_by_contact(self, contact):
-        """ create or get an existing 1:1 chat object for the specified contact or contact id.
+    def get_fresh_messages(self):
+        """ yield all fresh messages from all chats. """
+        dc_array = ffi.gc(
+            lib.dc_get_fresh_msgs(self._dc_context),
+            lib.dc_array_unref
+        )
+        yield from iter_array(dc_array, lambda x: Message.from_db(self, x))
 
-        :param contact: chat_id (int) or contact object.
-        :returns: a :class:`deltachat.chat.Chat` object.
-        """
-        if hasattr(contact, "id"):
-            if contact._dc_context != self._dc_context:
-                raise ValueError("Contact belongs to a different Account")
-            contact_id = contact.id
-        else:
-            assert isinstance(contact, int)
-            contact_id = contact
-        chat_id = lib.dc_create_chat_by_contact_id(self._dc_context, contact_id)
-        return Chat(self, chat_id)
+    def create_chat(self, obj):
+        """ Create a 1:1 chat with Account, Contact or e-mail address. """
+        return self.create_contact(obj).create_chat()
 
-    def create_chat_by_message(self, message):
-        """ create or get an existing chat object for the
-        the specified message.
+    def _create_chat_by_message_id(self, msg_id):
+        return Chat(self, lib.dc_create_chat_by_msg_id(self._dc_context, msg_id))
 
-        :param message: messsage id or message instance.
-        :returns: a :class:`deltachat.chat.Chat` object.
-        """
-        if hasattr(message, "id"):
-            if self._dc_context != message._dc_context:
-                raise ValueError("Message belongs to a different Account")
-            msg_id = message.id
-        else:
-            assert isinstance(message, int)
-            msg_id = message
-        chat_id = lib.dc_create_chat_by_msg_id(self._dc_context, msg_id)
-        return Chat(self, chat_id)
-
-    def create_group_chat(self, name, verified=False):
+    def create_group_chat(self, name, contacts=None, verified=False):
         """ create a new group chat object.
 
         Chats are unpromoted until the first message is sent.
 
+        :param contacts: list of contacts to add
         :param verified: if true only verified contacts can be added.
         :returns: a :class:`deltachat.chat.Chat` object.
         """
         bytes_name = name.encode("utf8")
         chat_id = lib.dc_create_group_chat(self._dc_context, int(verified), bytes_name)
-        return Chat(self, chat_id)
+        chat = Chat(self, chat_id)
+        if contacts is not None:
+            for contact in contacts:
+                chat.add_contact(contact)
+        return chat
 
     def get_chats(self):
         """ return list of chats.
@@ -357,45 +399,35 @@ class Account(object):
         lib.dc_delete_msgs(self._dc_context, msg_ids, len(msg_ids))
 
     def export_self_keys(self, path):
-        """ export public and private keys to the specified directory. """
+        """ export public and private keys to the specified directory.
+
+        Note that the account does not have to be started.
+        """
         return self._export(path, imex_cmd=1)
 
     def export_all(self, path):
         """return new file containing a backup of all database state
         (chats, contacts, keys, media, ...). The file is created in the
         the `path` directory.
+
+        Note that the account does not have to be started.
         """
         export_files = self._export(path, 11)
         if len(export_files) != 1:
             raise RuntimeError("found more than one new file")
         return export_files[0]
 
-    def _imex_events_clear(self):
-        try:
-            while True:
-                self._imex_events.get_nowait()
-        except Empty:
-            pass
-
     def _export(self, path, imex_cmd):
-        self._imex_events_clear()
-        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
-        if not self._threads.is_started():
-            lib.dc_perform_imap_jobs(self._dc_context)
-        files_written = []
-        while True:
-            ev = self._imex_events.get()
-            if isinstance(ev, str):
-                files_written.append(ev)
-            elif isinstance(ev, bool):
-                if not ev:
-                    raise ValueError("export failed, exp-files: {}".format(files_written))
-                return files_written
+        with self.temp_plugin(ImexTracker()) as imex_tracker:
+            lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
+            return imex_tracker.wait_finish()
 
     def import_self_keys(self, path):
         """ Import private keys found in the `path` directory.
         The last imported key is made the default keys unless its name
         contains the string legacy. Public keys are not imported.
+
+        Note that the account does not have to be started.
         """
         self._import(path, imex_cmd=2)
 
@@ -408,12 +440,9 @@ class Account(object):
         self._import(path, imex_cmd=12)
 
     def _import(self, path, imex_cmd):
-        self._imex_events_clear()
-        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
-        if not self._threads.is_started():
-            lib.dc_perform_imap_jobs(self._dc_context)
-        if not self._imex_events.get():
-            raise ValueError("import from path '{}' failed".format(path))
+        with self.temp_plugin(ImexTracker()) as imex_tracker:
+            lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
+            imex_tracker.wait_finish()
 
     def initiate_key_transfer(self):
         """return setup code after a Autocrypt setup message
@@ -421,8 +450,8 @@ class Account(object):
         If sending out was unsuccessful, a RuntimeError is raised.
         """
         self.check_is_configured()
-        if not self._threads.is_started():
-            raise RuntimeError("threads not running, can not send out")
+        if not self.is_started():
+            raise RuntimeError("IO not running, can not send out")
         res = lib.dc_initiate_key_transfer(self._dc_context)
         if res == ffi.NULL:
             raise RuntimeError("could not send out autocrypt setup message")
@@ -478,63 +507,6 @@ class Account(object):
             raise ValueError("could not join group")
         return Chat(self, chat_id)
 
-    def stop_ongoing(self):
-        lib.dc_stop_ongoing_process(self._dc_context)
-
-    #
-    # meta API for start/stop and event based processing
-    #
-
-    def wait_next_incoming_message(self):
-        """ wait for and return next incoming message. """
-        ev = self._evlogger.get_matching("DC_EVENT_INCOMING_MSG")
-        return self.get_message_by_id(ev[2])
-
-    def start_threads(self, mvbox=False, sentbox=False):
-        """ start IMAP/SMTP threads (and configure account if it hasn't happened).
-
-        :raises: ValueError if 'addr' or 'mail_pw' are not configured.
-        :returns: None
-        """
-        if not self.is_configured():
-            self.configure()
-        self._threads.start(mvbox=mvbox, sentbox=sentbox)
-
-    def stop_threads(self, wait=True):
-        """ stop IMAP/SMTP threads. """
-        if self._threads.is_started():
-            self.stop_ongoing()
-            self._threads.stop(wait=wait)
-
-    def shutdown(self, wait=True):
-        """ stop threads and close and remove underlying dc_context and callbacks. """
-        if hasattr(self, "_dc_context") and hasattr(self, "_threads"):
-            # print("SHUTDOWN", self)
-            self.stop_threads(wait=False)
-            lib.dc_close(self._dc_context)
-            self.stop_threads(wait=wait)  # to wait for threads
-            deltachat.clear_context_callback(self._dc_context)
-            del self._dc_context
-            atexit.unregister(self.shutdown)
-
-    def _process_event(self, ctx, evt_name, data1, data2):
-        assert ctx == self._dc_context
-        if hasattr(self, "_evlogger"):
-            self._evlogger(evt_name, data1, data2)
-            method = getattr(self, "on_" + evt_name.lower(), None)
-            if method is not None:
-                method(data1, data2)
-        return 0
-
-    def on_dc_event_imex_progress(self, data1, data2):
-        if data1 == 1000:
-            self._imex_events.put(True)
-        elif data1 == 0:
-            self._imex_events.put(False)
-
-    def on_dc_event_imex_file_written(self, data1, data2):
-        self._imex_events.put(data1)
-
     def set_location(self, latitude=0.0, longitude=0.0, accuracy=0.0):
         """set a new location. It effects all chats where we currently
         have enabled location streaming.
@@ -549,160 +521,104 @@ class Account(object):
         if dc_res == 0:
             raise ValueError("no chat is streaming locations")
 
+    #
+    # meta API for start/stop and event based processing
+    #
 
-class IOThreads:
-    def __init__(self, dc_context, log_event=lambda *args: None):
-        self._dc_context = dc_context
-        self._thread_quitflag = False
-        self._name2thread = {}
-        self._log_event = log_event
+    def add_account_plugin(self, plugin, name=None):
+        """ add an account plugin which implements one or more of
+        the :class:`deltachat.hookspec.PerAccount` hooks.
+        """
+        self._pm.register(plugin, name=name)
+        self._pm.check_pending()
+        return plugin
+
+    def remove_account_plugin(self, plugin, name=None):
+        """ remove an account plugin. """
+        self._pm.unregister(plugin, name=name)
+
+    @contextmanager
+    def temp_plugin(self, plugin):
+        """ run a with-block with the given plugin temporarily registered. """
+        self._pm.register(plugin)
+        yield plugin
+        self._pm.unregister(plugin)
+
+    def stop_ongoing(self):
+        """ Stop ongoing securejoin, configuration or other core jobs. """
+        lib.dc_stop_ongoing_process(self._dc_context)
+
+    def start_io(self):
+        """ start this account's IO scheduling (Rust-core async scheduler)
+
+        If this account is not configured an Exception is raised.
+        You need to call account.configure() and account.wait_configure_finish()
+        before.
+
+        You may call `stop_scheduler`, `wait_shutdown` or `shutdown` after the
+        account is started.
+
+        :raises MissingCredentials: if `addr` and `mail_pw` values are not set.
+        :raises ConfigureFailed: if the account could not be configured.
+
+        :returns: None
+        """
+        if not self.is_configured():
+            raise ValueError("account not configured, cannot start io")
+        lib.dc_start_io(self._dc_context)
+
+    def configure(self):
+        """ Start configuration process and return a Configtracker instance
+        on which you can block with wait_finish() to get a True/False success
+        value for the configuration process.
+        """
+        assert not self.is_configured()
+        if not self.get_config("addr") or not self.get_config("mail_pw"):
+            raise MissingCredentials("addr or mail_pwd not set in config")
+        configtracker = ConfigureTracker(self)
+        self.add_account_plugin(configtracker)
+        lib.dc_configure(self._dc_context)
+        return configtracker
 
     def is_started(self):
-        return len(self._name2thread) > 0
+        return self._event_thread.is_alive() and bool(lib.dc_is_io_running(self._dc_context))
 
-    def start(self, imap=True, smtp=True, mvbox=False, sentbox=False):
-        assert not self.is_started()
-        if imap:
-            self._start_one_thread("inbox", self.imap_thread_run)
-        if mvbox:
-            self._start_one_thread("mvbox", self.mvbox_thread_run)
-        if sentbox:
-            self._start_one_thread("sentbox", self.sentbox_thread_run)
-        if smtp:
-            self._start_one_thread("smtp", self.smtp_thread_run)
+    def wait_shutdown(self):
+        """ wait until shutdown of this account has completed. """
+        self._shutdown_event.wait()
 
-    def _start_one_thread(self, name, func):
-        self._name2thread[name] = t = threading.Thread(target=func, name=name)
-        t.setDaemon(1)
-        t.start()
+    def stop_io(self):
+        """ stop core IO scheduler if it is running. """
+        self.log("stop_ongoing")
+        self.stop_ongoing()
 
-    def stop(self, wait=False):
-        self._thread_quitflag = True
-        lib.dc_interrupt_imap_idle(self._dc_context)
-        lib.dc_interrupt_smtp_idle(self._dc_context)
-        lib.dc_interrupt_mvbox_idle(self._dc_context)
-        lib.dc_interrupt_sentbox_idle(self._dc_context)
-        if wait:
-            for name, thread in self._name2thread.items():
-                thread.join()
+        if bool(lib.dc_is_io_running(self._dc_context)):
+            self.log("dc_stop_io (stop core IO scheduler)")
+            lib.dc_stop_io(self._dc_context)
+        else:
+            self.log("stop_scheduler called on non-running context")
 
-    def imap_thread_run(self):
-        self._log_event("py-bindings-info", 0, "INBOX THREAD START")
-        while not self._thread_quitflag:
-            lib.dc_perform_imap_jobs(self._dc_context)
-            if not self._thread_quitflag:
-                lib.dc_perform_imap_fetch(self._dc_context)
-            if not self._thread_quitflag:
-                lib.dc_perform_imap_idle(self._dc_context)
-        self._log_event("py-bindings-info", 0, "INBOX THREAD FINISHED")
-
-    def mvbox_thread_run(self):
-        self._log_event("py-bindings-info", 0, "MVBOX THREAD START")
-        while not self._thread_quitflag:
-            lib.dc_perform_mvbox_jobs(self._dc_context)
-            lib.dc_perform_mvbox_fetch(self._dc_context)
-            lib.dc_perform_mvbox_idle(self._dc_context)
-        self._log_event("py-bindings-info", 0, "MVBOX THREAD FINISHED")
-
-    def sentbox_thread_run(self):
-        self._log_event("py-bindings-info", 0, "SENTBOX THREAD START")
-        while not self._thread_quitflag:
-            lib.dc_perform_sentbox_jobs(self._dc_context)
-            lib.dc_perform_sentbox_fetch(self._dc_context)
-            lib.dc_perform_sentbox_idle(self._dc_context)
-        self._log_event("py-bindings-info", 0, "SENTBOX THREAD FINISHED")
-
-    def smtp_thread_run(self):
-        self._log_event("py-bindings-info", 0, "SMTP THREAD START")
-        while not self._thread_quitflag:
-            lib.dc_perform_smtp_jobs(self._dc_context)
-            lib.dc_perform_smtp_idle(self._dc_context)
-        self._log_event("py-bindings-info", 0, "SMTP THREAD FINISHED")
-
-
-class EventLogger:
-    _loglock = threading.RLock()
-
-    def __init__(self, dc_context, logid=None, debug=True):
-        self._dc_context = dc_context
-        self._event_queue = Queue()
-        self._debug = debug
-        if logid is None:
-            logid = str(self._dc_context).strip(">").split()[-1]
-        self.logid = logid
-        self._timeout = None
-        self.init_time = time.time()
-
-    def __call__(self, evt_name, data1, data2):
-        self._log_event(evt_name, data1, data2)
-        self._event_queue.put((evt_name, data1, data2))
-
-    def set_timeout(self, timeout):
-        self._timeout = timeout
-
-    def consume_events(self, check_error=True):
-        while not self._event_queue.empty():
-            self.get()
-
-    def get(self, timeout=None, check_error=True):
-        timeout = timeout or self._timeout
-        ev = self._event_queue.get(timeout=timeout)
-        if check_error and ev[0] == "DC_EVENT_ERROR":
-            raise ValueError("{}({!r},{!r})".format(*ev))
-        return ev
-
-    def ensure_event_not_queued(self, event_name_regex):
-        __tracebackhide__ = True
-        rex = re.compile("(?:{}).*".format(event_name_regex))
-        while 1:
-            try:
-                ev = self._event_queue.get(False)
-            except Empty:
-                break
-            else:
-                assert not rex.match(ev[0]), "event found {}".format(ev)
-
-    def get_matching(self, event_name_regex, check_error=True, timeout=None):
-        self._log("-- waiting for event with regex: {} --".format(event_name_regex))
-        rex = re.compile("(?:{}).*".format(event_name_regex))
-        while 1:
-            ev = self.get(timeout=timeout, check_error=check_error)
-            if rex.match(ev[0]):
-                return ev
-
-    def get_info_matching(self, regex):
-        rex = re.compile("(?:{}).*".format(regex))
-        while 1:
-            ev = self.get_matching("DC_EVENT_INFO")
-            if rex.match(ev[2]):
-                return ev
-
-    def _log_event(self, evt_name, data1, data2):
-        # don't show events that are anyway empty impls now
-        if evt_name == "DC_EVENT_GET_STRING":
+    def shutdown(self):
+        """ shutdown and destroy account (stop callback thread, close and remove
+        underlying dc_context)."""
+        if self._dc_context is None:
             return
-        if self._debug:
-            evpart = "{}({!r},{!r})".format(evt_name, data1, data2)
-            self._log(evpart)
 
-    def _log(self, msg):
-        t = threading.currentThread()
-        tname = getattr(t, "name", t)
-        if tname == "MainThread":
-            tname = "MAIN"
-        with self._loglock:
-            print("{:2.2f} [{}-{}] {}".format(time.time() - self.init_time, tname, self.logid, msg))
+        self.stop_io()
 
+        self.log("remove dc_context references")
+        # the dc_context_unref triggers get_next_event to return ffi.NULL
+        # which in turns makes the event thread finish execution
+        self._dc_context = None
 
-def _destroy_dc_context(dc_context, dc_context_unref=lib.dc_context_unref):
-    # destructor for dc_context
-    dc_context_unref(dc_context)
-    try:
-        deltachat.clear_context_callback(dc_context)
-    except (TypeError, AttributeError):
-        # we are deep into Python Interpreter shutdown,
-        # so no need to clear the callback context mapping.
-        pass
+        self.log("wait for event thread to finish")
+        self._event_thread.wait()
+
+        self._shutdown_event.set()
+
+        hook = hookspec.Global._get_plugin_manager().hook
+        hook.dc_account_after_shutdown(account=self)
+        self.log("shutdown finished")
 
 
 class ScannedQRCode:

@@ -1,17 +1,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::str;
 
+use async_std::path::PathBuf;
 use num_traits::FromPrimitive;
+use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobError, BlobObject};
 use crate::context::Context;
-use crate::error;
+use crate::error::{self, bail, ensure};
+use crate::message::MsgId;
 use crate::mimeparser::SystemMessage;
 
 /// Available param keys.
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash, PartialOrd, Ord, FromPrimitive)]
+#[derive(
+    PartialEq, Eq, Debug, Clone, Copy, Hash, PartialOrd, Ord, FromPrimitive, Serialize, Deserialize,
+)]
 #[repr(u8)]
 pub enum Param {
     /// For messages and jobs
@@ -62,9 +66,6 @@ pub enum Param {
     Arg4 = b'H',
 
     /// For Messages
-    Error = b'L',
-
-    /// For Messages
     AttachGroupImage = b'A',
 
     /// For Messages: space-separated list of messaged IDs of forwarded copies.
@@ -85,37 +86,37 @@ pub enum Param {
     SetLongitude = b'n',
 
     /// For Jobs
-    ServerFolder = b'Z',
-
-    /// For Jobs
-    ServerUid = b'z',
-
-    /// For Jobs
     AlsoMove = b'M',
 
     /// For Jobs: space-separated list of message recipients
     Recipients = b'R',
 
-    // For Groups
+    /// For Groups
     Unpromoted = b'U',
 
-    // For Groups and Contacts
+    /// For Groups and Contacts
     ProfileImage = b'i',
 
-    // For Chats
+    /// For Chats
     Selftalk = b'K',
 
-    // For Chats
+    /// For Chats: So that on sending a new message we can sent the subject to "Re: <last subject>"
+    LastSubject = b't',
+
+    /// For Chats
     Devicetalk = b'D',
 
-    // For QR
+    /// For QR
     Auth = b's',
 
-    // For QR
+    /// For QR
     GroupId = b'x',
 
-    // For QR
+    /// For QR
     GroupName = b'g',
+
+    /// For MDN-sending job
+    MsgId = b'I',
 }
 
 /// Possible values for `Param::ForcePlaintext`.
@@ -131,7 +132,7 @@ pub enum ForcePlaintext {
 /// The structure is serialized by calling `to_string()` on it.
 ///
 /// Only for library-internal use.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Params {
     inner: BTreeMap<Param, String>,
 }
@@ -274,7 +275,8 @@ impl Params {
     /// created without copying if the path already referes to a valid
     /// blob.  If so a [BlobObject] will be returned regardless of the
     /// `create` argument.
-    pub fn get_blob<'a>(
+    #[allow(clippy::needless_lifetimes)]
+    pub async fn get_blob<'a>(
         &self,
         key: Param,
         context: &'a Context,
@@ -287,7 +289,7 @@ impl Params {
         let file = ParamsFile::from_param(context, val)?;
         let blob = match file {
             ParamsFile::FsPath(path) => match create {
-                true => BlobObject::new_from_path(context, path)?,
+                true => BlobObject::new_from_path(context, path).await?,
                 false => BlobObject::from_path(context, path)?,
             },
             ParamsFile::Blob(blob) => blob,
@@ -310,6 +312,12 @@ impl Params {
             ParamsFile::Blob(blob) => blob.to_abs_path(),
         };
         Ok(Some(path))
+    }
+
+    pub fn get_msg_id(&self) -> Option<MsgId> {
+        self.get(Param::MsgId)
+            .and_then(|x| x.parse::<u32>().ok())
+            .map(MsgId::new)
     }
 
     /// Set the given paramter to the passed in `i32`.
@@ -355,8 +363,8 @@ impl<'a> ParamsFile<'a> {
 mod tests {
     use super::*;
 
-    use std::fs;
-    use std::path::Path;
+    use async_std::fs;
+    use async_std::path::Path;
 
     use crate::test_utils::*;
 
@@ -404,9 +412,9 @@ mod tests {
         assert_eq!(p1.get(Param::Forwarded).unwrap(), "cli%40deltachat.de");
     }
 
-    #[test]
-    fn test_params_file_fs_path() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_params_file_fs_path() {
+        let t = dummy_context().await;
         if let ParamsFile::FsPath(p) = ParamsFile::from_param(&t.ctx, "/foo/bar/baz").unwrap() {
             assert_eq!(p, Path::new("/foo/bar/baz"));
         } else {
@@ -414,9 +422,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_params_file_blob() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_params_file_blob() {
+        let t = dummy_context().await;
         if let ParamsFile::Blob(b) = ParamsFile::from_param(&t.ctx, "$BLOBDIR/foo").unwrap() {
             assert_eq!(b.as_name(), "$BLOBDIR/foo");
         } else {
@@ -425,28 +433,33 @@ mod tests {
     }
 
     // Tests for Params::get_file(), Params::get_path() and Params::get_blob().
-    #[test]
-    fn test_params_get_fileparam() {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_params_get_fileparam() {
+        let t = dummy_context().await;
         let fname = t.dir.path().join("foo");
         let mut p = Params::new();
         p.set(Param::File, fname.to_str().unwrap());
 
         let file = p.get_file(Param::File, &t.ctx).unwrap().unwrap();
-        assert_eq!(file, ParamsFile::FsPath(fname.clone()));
+        assert_eq!(file, ParamsFile::FsPath(fname.clone().into()));
 
-        let path = p.get_path(Param::File, &t.ctx).unwrap().unwrap();
+        let path: PathBuf = p.get_path(Param::File, &t.ctx).unwrap().unwrap();
+        let fname: PathBuf = fname.into();
         assert_eq!(path, fname);
 
         // Blob does not exist yet, expect BlobError.
-        let err = p.get_blob(Param::File, &t.ctx, false).unwrap_err();
+        let err = p.get_blob(Param::File, &t.ctx, false).await.unwrap_err();
         match err {
             BlobError::WrongBlobdir { .. } => (),
             _ => panic!("wrong error type/variant: {:?}", err),
         }
 
-        fs::write(fname, b"boo").unwrap();
-        let blob = p.get_blob(Param::File, &t.ctx, true).unwrap().unwrap();
+        fs::write(fname, b"boo").await.unwrap();
+        let blob = p
+            .get_blob(Param::File, &t.ctx, true)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             blob,
             BlobObject::from_name(&t.ctx, "foo".to_string()).unwrap()
@@ -455,7 +468,11 @@ mod tests {
         // Blob in blobdir, expect blob.
         let bar = t.ctx.get_blobdir().join("bar");
         p.set(Param::File, bar.to_str().unwrap());
-        let blob = p.get_blob(Param::File, &t.ctx, false).unwrap().unwrap();
+        let blob = p
+            .get_blob(Param::File, &t.ctx, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             blob,
             BlobObject::from_name(&t.ctx, "bar".to_string()).unwrap()
@@ -464,6 +481,10 @@ mod tests {
         p.remove(Param::File);
         assert!(p.get_file(Param::File, &t.ctx).unwrap().is_none());
         assert!(p.get_path(Param::File, &t.ctx).unwrap().is_none());
-        assert!(p.get_blob(Param::File, &t.ctx, false).unwrap().is_none());
+        assert!(p
+            .get_blob(Param::File, &t.ctx, false)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

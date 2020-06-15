@@ -5,16 +5,15 @@
 use tempfile::{tempdir, TempDir};
 
 use crate::config::Config;
-use crate::constants::KeyType;
-use crate::context::{Context, ContextCallback};
-use crate::events::Event;
-use crate::key;
+use crate::context::Context;
+use crate::dc_tools::EmailAddress;
+use crate::key::{self, DcKey};
 
 /// A Context and temporary directory.
 ///
 /// The temporary directory can be used to store the SQLite database,
 /// see e.g. [test_context] which does this.
-pub struct TestContext {
+pub(crate) struct TestContext {
     pub ctx: Context,
     pub dir: TempDir,
 }
@@ -25,14 +24,10 @@ pub struct TestContext {
 /// "db.sqlite" in the [TestContext.dir] directory.
 ///
 /// [Context]: crate::context::Context
-pub fn test_context(callback: Option<Box<ContextCallback>>) -> TestContext {
+pub(crate) async fn test_context() -> TestContext {
     let dir = tempdir().unwrap();
     let dbfile = dir.path().join("db.sqlite");
-    let cb: Box<ContextCallback> = match callback {
-        Some(cb) => cb,
-        None => Box::new(|_, _| ()),
-    };
-    let ctx = Context::new(cb, "FakeOs".into(), dbfile).unwrap();
+    let ctx = Context::new("FakeOs".into(), dbfile.into()).await.unwrap();
     TestContext { ctx, dir }
 }
 
@@ -41,40 +36,74 @@ pub fn test_context(callback: Option<Box<ContextCallback>>) -> TestContext {
 /// The context will be opened and use the SQLite database as
 /// specified in [test_context] but there is no callback hooked up,
 /// i.e. [Context::call_cb] will always return `0`.
-pub fn dummy_context() -> TestContext {
-    test_context(None)
+pub(crate) async fn dummy_context() -> TestContext {
+    test_context().await
 }
 
-pub fn logging_cb(_ctx: &Context, evt: Event) {
-    match evt {
-        Event::Info(msg) => println!("I: {}", msg),
-        Event::Warning(msg) => println!("W: {}", msg),
-        Event::Error(msg) => println!("E: {}", msg),
-        _ => (),
+pub(crate) async fn configured_offline_context() -> TestContext {
+    configured_offline_context_with_addr("alice@example.org").await
+}
+
+pub(crate) async fn configured_offline_context_with_addr(addr: &str) -> TestContext {
+    let t = dummy_context().await;
+    t.ctx.set_config(Config::Addr, Some(addr)).await.unwrap();
+    t.ctx
+        .set_config(Config::ConfiguredAddr, Some(addr))
+        .await
+        .unwrap();
+    t.ctx
+        .set_config(Config::Configured, Some("1"))
+        .await
+        .unwrap();
+    t
+}
+
+/// Load a pre-generated keypair for alice@example.com from disk.
+///
+/// This saves CPU cycles by avoiding having to generate a key.
+///
+/// The keypair was created using the crate::key::tests::gen_key test.
+pub(crate) fn alice_keypair() -> key::KeyPair {
+    let addr = EmailAddress::new("alice@example.com").unwrap();
+    let public =
+        key::SignedPublicKey::from_base64(include_str!("../test-data/key/alice-public.asc"))
+            .unwrap();
+    let secret =
+        key::SignedSecretKey::from_base64(include_str!("../test-data/key/alice-secret.asc"))
+            .unwrap();
+    key::KeyPair {
+        addr,
+        public,
+        secret,
     }
 }
 
 /// Creates Alice with a pre-generated keypair.
 ///
-/// Returns the address of the keypair created (alice@example.org).
-pub fn configure_alice_keypair(ctx: &Context) -> String {
-    let addr = String::from("alice@example.org");
-    ctx.set_config(Config::ConfiguredAddr, Some(&addr)).unwrap();
+/// Returns the address of the keypair created (alice@example.com).
+pub(crate) async fn configure_alice_keypair(ctx: &Context) -> String {
+    let keypair = alice_keypair();
+    ctx.set_config(Config::ConfiguredAddr, Some(&keypair.addr.to_string()))
+        .await
+        .unwrap();
+    key::store_self_keypair(&ctx, &keypair, key::KeyPairUse::Default)
+        .await
+        .expect("Failed to save Alice's key");
+    keypair.addr.to_string()
+}
 
-    // The keypair was created using:
-    //   let (public, private) = crate::pgp::dc_pgp_create_keypair("alice@example.com")
-    //       .unwrap();
-    //   println!("{}", public.to_base64(64));
-    //   println!("{}", private.to_base64(64));
+/// Load a pre-generated keypair for bob@example.net from disk.
+///
+/// Like [alice_keypair] but a different key and identity.
+pub(crate) fn bob_keypair() -> key::KeyPair {
+    let addr = EmailAddress::new("bob@example.net").unwrap();
     let public =
-        key::Key::from_base64(include_str!("../test-data/key/public.asc"), KeyType::Public)
-            .unwrap();
-    let private = key::Key::from_base64(
-        include_str!("../test-data/key/private.asc"),
-        KeyType::Private,
-    )
-    .unwrap();
-    let saved = key::dc_key_save_self_keypair(&ctx, &public, &private, &addr, true, &ctx.sql);
-    assert_eq!(saved, true, "Failed to save Alice's key");
-    addr
+        key::SignedPublicKey::from_base64(include_str!("../test-data/key/bob-public.asc")).unwrap();
+    let secret =
+        key::SignedSecretKey::from_base64(include_str!("../test-data/key/bob-secret.asc")).unwrap();
+    key::KeyPair {
+        addr,
+        public,
+        secret,
+    }
 }

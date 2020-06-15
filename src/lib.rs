@@ -1,12 +1,7 @@
+#![forbid(unsafe_code)]
 #![deny(clippy::correctness, missing_debug_implementations, clippy::all)]
-// for now we hide warnings to not clutter/hide errors during "cargo clippy"
-#![allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 #![allow(clippy::match_bool)]
-#![feature(ptr_wrapping_offset_from)]
-#![feature(drain_filter)]
 
-#[macro_use]
-extern crate failure_derive;
 #[macro_use]
 extern crate num_derive;
 #[macro_use]
@@ -16,13 +11,22 @@ extern crate rusqlite;
 extern crate strum;
 #[macro_use]
 extern crate strum_macros;
-#[macro_use]
-extern crate debug_stub_derive;
+
+pub trait ToSql: rusqlite::ToSql + Send + Sync {}
+
+impl<T: rusqlite::ToSql + Send + Sync> ToSql for T {}
 
 #[macro_use]
 pub mod log;
 #[macro_use]
 pub mod error;
+
+#[cfg(feature = "internals")]
+#[macro_use]
+pub mod sql;
+#[cfg(not(feature = "internals"))]
+#[macro_use]
+mod sql;
 
 pub mod headerdef;
 
@@ -30,22 +34,22 @@ pub(crate) mod events;
 pub use events::*;
 
 mod aheader;
-pub mod blob;
+mod blob;
 pub mod chat;
 pub mod chatlist;
 pub mod config;
-pub mod configure;
+mod configure;
 pub mod constants;
 pub mod contact;
 pub mod context;
 mod e2ee;
 mod imap;
-mod imap_client;
 pub mod imex;
+mod scheduler;
+#[macro_use]
 pub mod job;
-mod job_thread;
 pub mod key;
-pub mod keyring;
+mod keyring;
 pub mod location;
 mod login_param;
 pub mod lot;
@@ -56,11 +60,11 @@ pub mod oauth2;
 mod param;
 pub mod peerstate;
 pub mod pgp;
+pub mod provider;
 pub mod qr;
 pub mod securejoin;
 mod simplify;
 mod smtp;
-pub mod sql;
 pub mod stock;
 mod token;
 #[macro_use]

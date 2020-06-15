@@ -9,7 +9,7 @@
 To download and install the official compiler for the Rust programming language, and the Cargo package manager, run the command in your user environment:
 
 ```
-curl https://sh.rustup.rs -sSf | sh
+$ curl https://sh.rustup.rs -sSf | sh
 ```
 
 ## Using the CLI client
@@ -17,8 +17,9 @@ curl https://sh.rustup.rs -sSf | sh
 Compile and run Delta Chat Core command line utility, using `cargo`:
 
 ```
-cargo run --example repl -- /path/to/db
+$ RUST_LOG=info cargo run --example repl --features repl -- ~/deltachat-db
 ```
+where ~/deltachat-db is the database file. Delta Chat will create it if it does not exist.
 
 Configure your account (if not already configured):
 
@@ -108,9 +109,28 @@ $ cargo test -- --ignored
 
 - `vendored`: When using Openssl for TLS, this bundles a vendored version.
 - `nightly`: Enable nightly only performance and security related features.
-- `ringbuf`: Enable the use of [`slice_deque`](https://github.com/gnzlbg/slice_deque) in pgp.
 
 [circle-shield]: https://img.shields.io/circleci/project/github/deltachat/deltachat-core-rust/master.svg?style=flat-square
 [circle]: https://circleci.com/gh/deltachat/deltachat-core-rust/
 [appveyor-shield]: https://ci.appveyor.com/api/projects/status/lqpegel3ld4ipxj8/branch/master?style=flat-square
 [appveyor]: https://ci.appveyor.com/project/dignifiedquire/deltachat-core-rust/branch/master
+
+## Language bindings and frontend projects
+
+Language bindings are available for:
+
+- [C](https://c.delta.chat)
+- [Node.js](https://www.npmjs.com/package/deltachat-node)
+- [Python](https://py.delta.chat)
+- [Go](https://github.com/hugot/go-deltachat/)
+- **Java** and **Swift** (contained in the Android/iOS repos)
+
+The following "frontend" projects make use of the Rust-library
+or its language bindings:
+
+- [Android](https://github.com/deltachat/deltachat-android)
+- [iOS](https://github.com/deltachat/deltachat-ios)
+- [Desktop](https://github.com/deltachat/deltachat-desktop)
+- [Pidgin](https://code.ur.gs/lupine/purple-plugin-delta/)
+- [Telepathy](https://code.ur.gs/lupine/telepathy-padfoot/)
+- several **Bots**

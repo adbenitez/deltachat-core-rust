@@ -2,7 +2,7 @@
 
 pub mod send;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_smtp::smtp::client::net::*;
 use async_smtp::*;
@@ -10,51 +10,52 @@ use async_smtp::*;
 use crate::constants::*;
 use crate::context::Context;
 use crate::events::Event;
-use crate::login_param::{dc_build_tls, LoginParam};
+use crate::login_param::{dc_build_tls, CertificateChecks, LoginParam};
 use crate::oauth2::*;
+use crate::provider::get_provider_info;
+use crate::stock::StockMessage;
 
 /// SMTP write and read timeout in seconds.
 const SMTP_TIMEOUT: u64 = 30;
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "Bad parameters")]
+    #[error("Bad parameters")]
     BadParameters,
 
-    #[fail(display = "Invalid login address {}: {}", address, error)]
+    #[error("Invalid login address {address}: {error}")]
     InvalidLoginAddress {
         address: String,
-        #[cause]
+        #[source]
         error: error::Error,
     },
 
-    #[fail(display = "SMTP failed to connect: {:?}", _0)]
-    ConnectionFailure(#[cause] smtp::error::Error),
+    #[error("SMTP: failed to connect: {0:?}")]
+    ConnectionFailure(#[source] smtp::error::Error),
 
-    #[fail(display = "SMTP: failed to setup connection {:?}", _0)]
-    ConnectionSetupFailure(#[cause] smtp::error::Error),
+    #[error("SMTP: failed to setup connection {0:?}")]
+    ConnectionSetupFailure(#[source] smtp::error::Error),
 
-    #[fail(display = "SMTP: oauth2 error {:?}", _0)]
+    #[error("SMTP: oauth2 error {address}")]
     Oauth2Error { address: String },
 
-    #[fail(display = "TLS error")]
-    Tls(#[cause] native_tls::Error),
-}
-
-impl From<native_tls::Error> for Error {
-    fn from(err: native_tls::Error) -> Error {
-        Error::Tls(err)
-    }
+    #[error("TLS error")]
+    Tls(#[from] async_native_tls::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Default, DebugStub)]
-pub struct Smtp {
-    #[debug_stub(some = "SmtpTransport")]
+#[derive(Default)]
+pub(crate) struct Smtp {
     transport: Option<smtp::SmtpTransport>,
+
     /// Email address we are sending from.
     from: Option<EmailAddress>,
+
+    /// Timestamp of last successful send/receive network interaction
+    /// (eg connect or send succeeded). On initialization and disconnect
+    /// it is set to None.
+    last_success: Option<Instant>,
 }
 
 impl Smtp {
@@ -64,14 +65,25 @@ impl Smtp {
     }
 
     /// Disconnect the SMTP transport and drop it entirely.
-    pub fn disconnect(&mut self) {
+    pub async fn disconnect(&mut self) {
         if let Some(mut transport) = self.transport.take() {
-            async_std::task::block_on(transport.close()).ok();
+            transport.close().await.ok();
+        }
+        self.last_success = None;
+    }
+
+    /// Return true if smtp was connected but is not known to
+    /// have been successfully used the last 60 seconds
+    pub async fn has_maybe_stale_connection(&self) -> bool {
+        if let Some(last_success) = self.last_success {
+            Instant::now().duration_since(last_success).as_secs() > 60
+        } else {
+            false
         }
     }
 
     /// Check whether we are connected.
-    pub fn is_connected(&self) -> bool {
+    pub async fn is_connected(&self) -> bool {
         self.transport
             .as_ref()
             .map(|t| t.is_connected())
@@ -79,18 +91,14 @@ impl Smtp {
     }
 
     /// Connect using the provided login params.
-    pub fn connect(&mut self, context: &Context, lp: &LoginParam) -> Result<()> {
-        async_std::task::block_on(self.inner_connect(context, lp))
-    }
-
-    async fn inner_connect(&mut self, context: &Context, lp: &LoginParam) -> Result<()> {
-        if self.is_connected() {
+    pub async fn connect(&mut self, context: &Context, lp: &LoginParam) -> Result<()> {
+        if self.is_connected().await {
             warn!(context, "SMTP already connected.");
             return Ok(());
         }
 
         if lp.send_server.is_empty() || lp.send_port == 0 {
-            context.call_cb(Event::ErrorNetwork("SMTP bad parameters.".into()));
+            context.emit_event(Event::ErrorNetwork("SMTP bad parameters.".into()));
             return Err(Error::BadParameters);
         }
 
@@ -99,19 +107,27 @@ impl Smtp {
                 address: lp.addr.clone(),
                 error: err,
             })?;
+
         self.from = Some(from);
 
         let domain = &lp.send_server;
         let port = lp.send_port as u16;
 
-        let tls_config = dc_build_tls(lp.smtp_certificate_checks)?.into();
+        let provider = get_provider_info(&lp.addr);
+        let strict_tls = match lp.smtp_certificate_checks {
+            CertificateChecks::Automatic => provider.map_or(false, |provider| provider.strict_tls),
+            CertificateChecks::Strict => true,
+            CertificateChecks::AcceptInvalidCertificates
+            | CertificateChecks::AcceptInvalidCertificates2 => false,
+        };
+        let tls_config = dc_build_tls(strict_tls);
         let tls_parameters = ClientTlsParameters::new(domain.to_string(), tls_config);
 
         let (creds, mechanism) = if 0 != lp.server_flags & (DC_LP_AUTH_OAUTH2 as i32) {
             // oauth2
             let addr = &lp.addr;
             let send_pw = &lp.send_pw;
-            let access_token = dc_get_oauth2_access_token(context, addr, send_pw, false);
+            let access_token = dc_get_oauth2_access_token(context, addr, send_pw, false).await;
             if access_token.is_none() {
                 return Err(Error::Oauth2Error {
                     address: addr.to_string(),
@@ -158,10 +174,23 @@ impl Smtp {
             .timeout(Some(Duration::from_secs(SMTP_TIMEOUT)));
 
         let mut trans = client.into_transport();
-        trans.connect().await.map_err(Error::ConnectionFailure)?;
+        if let Err(err) = trans.connect().await {
+            let message = context
+                .stock_string_repl_str2(
+                    StockMessage::ServerResponse,
+                    format!("SMTP {}:{}", domain, port),
+                    format!("{}, ({:?})", err.to_string(), err),
+                )
+                .await;
+
+            emit_event!(context, Event::ErrorNetwork(message));
+            return Err(Error::ConnectionFailure(err));
+        }
 
         self.transport = Some(trans);
-        context.call_cb(Event::SmtpConnected(format!(
+        self.last_success = Some(Instant::now());
+
+        context.emit_event(Event::SmtpConnected(format!(
             "SMTP-LOGIN as {} ok",
             lp.send_user,
         )));

@@ -1,21 +1,15 @@
 use crate::context::Context;
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "URL request error")]
-    GetError(#[cause] reqwest::Error),
+    #[error("URL request error")]
+    GetError(surf::Error),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-pub fn read_url(context: &Context, url: &str) -> Result<String> {
+pub async fn read_url(context: &Context, url: &str) -> Result<String, Error> {
     info!(context, "Requesting URL {}", url);
 
-    match reqwest::Client::new()
-        .get(url)
-        .send()
-        .and_then(|mut res| res.text())
-    {
+    match surf::get(url).recv_string().await {
         Ok(res) => Ok(res),
         Err(err) => {
             info!(context, "Can\'t read URL {}", url);

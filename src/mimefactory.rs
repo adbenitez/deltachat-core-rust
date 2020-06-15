@@ -9,38 +9,45 @@ use crate::contact::*;
 use crate::context::{get_version_str, Context};
 use crate::dc_tools::*;
 use crate::e2ee::*;
-use crate::error::Error;
+use crate::error::{bail, ensure, format_err, Error};
 use crate::location;
-use crate::message::MsgId;
 use crate::message::{self, Message};
 use crate::mimeparser::SystemMessage;
 use crate::param::*;
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
+use crate::simplify::escape_message_footer_marks;
 use crate::stock::StockMessage;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+// attachments of 25 mb brutto should work on the majority of providers
+// (brutto examples: web.de=50, 1&1=40, t-online.de=32, gmail=25, posteo=50, yahoo=25, all-inkl=100).
+// as an upper limit, we double the size; the core won't send messages larger than this
+// to get the netto sizes, we subtract 1 mb header-overhead and the base64-overhead.
+pub const RECOMMENDED_FILE_SIZE: u64 = 24 * 1024 * 1024 / 4 * 3;
+const UPPER_LIMIT_FILE_SIZE: u64 = 49 * 1024 * 1024 / 4 * 3;
+
+#[derive(Debug, Clone)]
 pub enum Loaded {
-    Message,
-    MDN,
+    Message { chat: Chat },
+    MDN { additional_msg_ids: Vec<String> },
 }
 
 /// Helper to construct mime messages.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MimeFactory<'a, 'b> {
-    pub from_addr: String,
-    pub from_displayname: String,
-    pub selfstatus: String,
-    pub recipients_names: Vec<String>,
-    pub recipients_addr: Vec<String>,
-    pub timestamp: i64,
-    pub loaded: Loaded,
-    pub msg: &'b Message,
-    pub chat: Option<Chat>,
-    pub increation: bool,
-    pub in_reply_to: String,
-    pub references: String,
-    pub req_mdn: bool,
-    pub context: &'a Context,
+    from_addr: String,
+    from_displayname: String,
+    selfstatus: String,
+
+    /// Vector of pairs of recipient name and address
+    recipients: Vec<(String, String)>,
+
+    timestamp: i64,
+    loaded: Loaded,
+    msg: &'b Message,
+    in_reply_to: String,
+    references: String,
+    req_mdn: bool,
+    context: &'a Context,
     last_added_location_id: u32,
     attach_selfavatar: bool,
 }
@@ -53,197 +60,183 @@ pub struct RenderedEmail {
     pub is_encrypted: bool,
     pub is_gossiped: bool,
     pub last_added_location_id: u32,
-    /// None for MDN, the message id otherwise
-    pub foreign_id: Option<MsgId>,
-
-    pub from: String,
-    pub recipients: Vec<String>,
 
     /// Message ID (Message in the sense of Email)
     pub rfc724_mid: String,
 }
 
 impl<'a, 'b> MimeFactory<'a, 'b> {
-    pub fn from_msg(
+    pub async fn from_msg(
         context: &'a Context,
         msg: &'b Message,
-        add_selfavatar: bool,
+        attach_selfavatar: bool,
     ) -> Result<MimeFactory<'a, 'b>, Error> {
-        let chat = Chat::load_from_db(context, msg.chat_id)?;
+        let chat = Chat::load_from_db(context, msg.chat_id).await?;
 
-        let mut factory = MimeFactory {
-            from_addr: context
-                .get_config(Config::ConfiguredAddr)
-                .unwrap_or_default(),
-            from_displayname: context.get_config(Config::Displayname).unwrap_or_default(),
-            selfstatus: context
-                .get_config(Config::Selfstatus)
-                .unwrap_or_else(|| context.stock_str(StockMessage::StatusLine).to_string()),
-            recipients_names: Vec::with_capacity(5),
-            recipients_addr: Vec::with_capacity(5),
-            timestamp: msg.timestamp_sort,
-            loaded: Loaded::Message,
-            msg,
-            chat: Some(chat),
-            increation: msg.is_increation(),
-            in_reply_to: String::default(),
-            references: String::default(),
-            req_mdn: false,
-            last_added_location_id: 0,
-            attach_selfavatar: add_selfavatar,
-            context,
-        };
-
-        // just set the chat above
-        let chat = factory.chat.as_ref().unwrap();
+        let from_addr = context
+            .get_config(Config::ConfiguredAddr)
+            .await
+            .unwrap_or_default();
+        let from_displayname = context
+            .get_config(Config::Displayname)
+            .await
+            .unwrap_or_default();
+        let mut recipients = Vec::with_capacity(5);
+        let mut req_mdn = false;
 
         if chat.is_self_talk() {
-            factory
-                .recipients_names
-                .push(factory.from_displayname.to_string());
-            factory.recipients_addr.push(factory.from_addr.to_string());
+            recipients.push((from_displayname.to_string(), from_addr.to_string()));
         } else {
-            context.sql.query_map(
-                "SELECT c.authname, c.addr  \
+            context
+                .sql
+                .query_map(
+                    "SELECT c.authname, c.addr  \
                  FROM chats_contacts cc  \
                  LEFT JOIN contacts c ON cc.contact_id=c.id  \
                  WHERE cc.chat_id=? AND cc.contact_id>9;",
-                params![factory.msg.chat_id as i32],
-                |row| {
-                    let authname: String = row.get(0)?;
-                    let addr: String = row.get(1)?;
-                    Ok((authname, addr))
-                },
-                |rows| {
-                    for row in rows {
-                        let (authname, addr) = row?;
-                        if !vec_contains_lowercase(&factory.recipients_addr, &addr) {
-                            factory.recipients_addr.push(addr);
-                            factory.recipients_names.push(authname);
+                    paramsv![msg.chat_id],
+                    |row| {
+                        let authname: String = row.get(0)?;
+                        let addr: String = row.get(1)?;
+                        Ok((authname, addr))
+                    },
+                    |rows| {
+                        for row in rows {
+                            let (authname, addr) = row?;
+                            if !recipients_contain_addr(&recipients, &addr) {
+                                recipients.push((authname, addr));
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )
+                .await?;
 
-            let command = factory.msg.param.get_cmd();
-            let msg = &factory.msg;
+            let command = msg.param.get_cmd();
 
-            /* for added members, the list is just fine */
-            if command == SystemMessage::MemberRemovedFromGroup {
-                let email_to_remove = msg.param.get(Param::Arg).unwrap_or_default();
-
-                let self_addr = context
-                    .get_config(Config::ConfiguredAddr)
-                    .unwrap_or_default();
-
-                if !email_to_remove.is_empty()
-                    && !addr_cmp(email_to_remove, self_addr)
-                    && !vec_contains_lowercase(&factory.recipients_addr, &email_to_remove)
-                {
-                    factory.recipients_names.push("".to_string());
-                    factory.recipients_addr.push(email_to_remove.to_string());
-                }
-            }
             if command != SystemMessage::AutocryptSetupMessage
                 && command != SystemMessage::SecurejoinMessage
-                && context.get_config_bool(Config::MdnsEnabled)
+                && context.get_config_bool(Config::MdnsEnabled).await
             {
-                factory.req_mdn = true;
+                req_mdn = true;
             }
         }
-        let row = context.sql.query_row(
-            "SELECT mime_in_reply_to, mime_references FROM msgs WHERE id=?",
-            params![msg.id],
-            |row| {
-                let in_reply_to: String = row.get(0)?;
-                let references: String = row.get(1)?;
+        let (in_reply_to, references) = context
+            .sql
+            .query_row(
+                "SELECT mime_in_reply_to, mime_references FROM msgs WHERE id=?",
+                paramsv![msg.id],
+                |row| {
+                    let in_reply_to: String = row.get(0)?;
+                    let references: String = row.get(1)?;
 
-                Ok((
-                    render_rfc724_mid_list(&in_reply_to),
-                    render_rfc724_mid_list(&references),
-                ))
-            },
-        );
+                    Ok((
+                        render_rfc724_mid_list(&in_reply_to),
+                        render_rfc724_mid_list(&references),
+                    ))
+                },
+            )
+            .await?;
 
-        match row {
-            Ok((in_reply_to, references)) => {
-                factory.in_reply_to = in_reply_to;
-                factory.references = references;
-            }
-            Err(err) => {
-                error!(
-                    context,
-                    "mimefactory: failed to load mime_in_reply_to: {:?}", err
-                );
-            }
-        }
-
+        let default_str = context
+            .stock_str(StockMessage::StatusLine)
+            .await
+            .to_string();
+        let factory = MimeFactory {
+            from_addr,
+            from_displayname,
+            selfstatus: context
+                .get_config(Config::Selfstatus)
+                .await
+                .unwrap_or_else(|| default_str),
+            recipients,
+            timestamp: msg.timestamp_sort,
+            loaded: Loaded::Message { chat },
+            msg,
+            in_reply_to,
+            references,
+            req_mdn,
+            last_added_location_id: 0,
+            attach_selfavatar,
+            context,
+        };
         Ok(factory)
     }
 
-    pub fn from_mdn(context: &'a Context, msg: &'b Message) -> Result<Self, Error> {
-        // MDNs not enabled - check this is late, in the job. the
-        // user may have changed its choice while offline ...
-        ensure!(
-            context.get_config_bool(Config::MdnsEnabled),
-            "MDNs meanwhile disabled"
-        );
+    pub async fn from_mdn(
+        context: &'a Context,
+        msg: &'b Message,
+        additional_msg_ids: Vec<String>,
+    ) -> Result<MimeFactory<'a, 'b>, Error> {
+        ensure!(!msg.chat_id.is_special(), "Invalid chat id");
 
-        let contact = Contact::load_from_db(context, msg.from_id)?;
+        let contact = Contact::load_from_db(context, msg.from_id).await?;
+        let from_addr = context
+            .get_config(Config::ConfiguredAddr)
+            .await
+            .unwrap_or_default();
+        let from_displayname = context
+            .get_config(Config::Displayname)
+            .await
+            .unwrap_or_default();
+        let default_str = context
+            .stock_str(StockMessage::StatusLine)
+            .await
+            .to_string();
+        let selfstatus = context
+            .get_config(Config::Selfstatus)
+            .await
+            .unwrap_or_else(|| default_str);
+        let timestamp = dc_create_smeared_timestamp(context).await;
 
-        // Do not send MDNs trash etc.; chats.blocked is already checked by the caller
-        // in dc_markseen_msgs()
-        ensure!(!contact.is_blocked(), "Contact blocked");
-        ensure!(msg.chat_id > DC_CHAT_ID_LAST_SPECIAL, "Invalid chat id");
-
-        Ok(MimeFactory {
+        let res = MimeFactory::<'a, 'b> {
             context,
-            from_addr: context
-                .get_config(Config::ConfiguredAddr)
-                .unwrap_or_default(),
-            from_displayname: context.get_config(Config::Displayname).unwrap_or_default(),
-            selfstatus: context
-                .get_config(Config::Selfstatus)
-                .unwrap_or_else(|| context.stock_str(StockMessage::StatusLine).to_string()),
-            recipients_names: vec![contact.get_authname().to_string()],
-            recipients_addr: vec![contact.get_addr().to_string()],
-            timestamp: dc_create_smeared_timestamp(context),
-            loaded: Loaded::MDN,
+            from_addr,
+            from_displayname,
+            selfstatus,
+            recipients: vec![(
+                contact.get_authname().to_string(),
+                contact.get_addr().to_string(),
+            )],
+            timestamp,
+            loaded: Loaded::MDN { additional_msg_ids },
             msg,
-            chat: None,
-            increation: false,
             in_reply_to: String::default(),
             references: String::default(),
             req_mdn: false,
             last_added_location_id: 0,
             attach_selfavatar: false,
-        })
+        };
+
+        Ok(res)
     }
 
-    fn peerstates_for_recipients(&self) -> Result<Vec<(Option<Peerstate>, &str)>, Error> {
+    async fn peerstates_for_recipients(&self) -> Result<Vec<(Option<Peerstate<'_>>, &str)>, Error> {
         let self_addr = self
             .context
             .get_config(Config::ConfiguredAddr)
+            .await
             .ok_or_else(|| format_err!("Not configured"))?;
 
-        Ok(self
-            .recipients_addr
+        let mut res = Vec::new();
+        for (_, addr) in self
+            .recipients
             .iter()
-            .filter(|addr| *addr != &self_addr)
-            .map(|addr| {
-                (
-                    Peerstate::from_addr(self.context, &self.context.sql, addr),
-                    addr.as_str(),
-                )
-            })
-            .collect())
+            .filter(|(_, addr)| addr != &self_addr)
+        {
+            res.push((
+                Peerstate::from_addr(self.context, addr).await,
+                addr.as_str(),
+            ));
+        }
+
+        Ok(res)
     }
 
-    fn is_e2ee_guranteed(&self) -> bool {
-        match self.loaded {
-            Loaded::Message => {
-                if self.chat.as_ref().unwrap().typ == Chattype::VerifiedGroup {
+    fn is_e2ee_guaranteed(&self) -> bool {
+        match &self.loaded {
+            Loaded::Message { chat } => {
+                if chat.typ == Chattype::VerifiedGroup {
                     return true;
                 }
 
@@ -264,28 +257,26 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
                 false
             }
-            Loaded::MDN => false,
+            Loaded::MDN { .. } => false,
         }
     }
 
     fn min_verified(&self) -> PeerstateVerifiedStatus {
-        match self.loaded {
-            Loaded::Message => {
-                let chat = self.chat.as_ref().unwrap();
+        match &self.loaded {
+            Loaded::Message { chat } => {
                 if chat.typ == Chattype::VerifiedGroup {
                     PeerstateVerifiedStatus::BidirectVerified
                 } else {
                     PeerstateVerifiedStatus::Unverified
                 }
             }
-            Loaded::MDN => PeerstateVerifiedStatus::Unverified,
+            Loaded::MDN { .. } => PeerstateVerifiedStatus::Unverified,
         }
     }
 
     fn should_force_plaintext(&self) -> i32 {
-        match self.loaded {
-            Loaded::Message => {
-                let chat = self.chat.as_ref().unwrap();
+        match &self.loaded {
+            Loaded::Message { chat } => {
                 if chat.typ == Chattype::VerifiedGroup {
                     0
                 } else {
@@ -295,30 +286,28 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                         .unwrap_or_default()
                 }
             }
-            Loaded::MDN => DC_FP_NO_AUTOCRYPT_HEADER,
+            Loaded::MDN { .. } => ForcePlaintext::NoAutocryptHeader as i32,
         }
     }
 
-    fn should_do_gossip(&self) -> bool {
-        match self.loaded {
-            Loaded::Message => {
-                let chat = self.chat.as_ref().unwrap();
+    async fn should_do_gossip(&self) -> bool {
+        match &self.loaded {
+            Loaded::Message { chat } => {
                 // beside key- and member-changes, force re-gossip every 48 hours
-                let gossiped_timestamp = chat.get_gossiped_timestamp(self.context);
-                if gossiped_timestamp == 0 || (gossiped_timestamp + (2 * 24 * 60 * 60)) > time() {
+                let gossiped_timestamp = chat.get_gossiped_timestamp(self.context).await;
+                if time() > gossiped_timestamp + (2 * 24 * 60 * 60) {
                     return true;
                 }
 
                 self.msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
             }
-            Loaded::MDN => false,
+            Loaded::MDN { .. } => false,
         }
     }
 
     fn grpimage(&self) -> Option<String> {
-        match self.loaded {
-            Loaded::Message => {
-                let chat = self.chat.as_ref().unwrap();
+        match &self.loaded {
+            Loaded::Message { chat } => {
                 let cmd = self.msg.param.get_cmd();
 
                 match cmd {
@@ -342,55 +331,85 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
                 None
             }
-            Loaded::MDN => None,
+            Loaded::MDN { .. } => None,
         }
     }
 
-    fn subject_str(&self) -> String {
+    async fn subject_str(&self) -> String {
         match self.loaded {
-            Loaded::Message => {
-                match self.chat {
-                    Some(ref chat) => {
-                        let raw = message::get_summarytext_by_raw(
-                            self.msg.type_0,
-                            self.msg.text.as_ref(),
-                            &self.msg.param,
-                            32,
-                            self.context,
-                        );
-                        let mut lines = raw.lines();
-                        let raw_subject = if let Some(line) = lines.next() {
-                            line
-                        } else {
-                            ""
-                        };
+            Loaded::Message { ref chat } => {
+                if self.msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage {
+                    self.context
+                        .stock_str(StockMessage::AcSetupMsgSubject)
+                        .await
+                        .into_owned()
+                } else if chat.typ == Chattype::Group || chat.typ == Chattype::VerifiedGroup {
+                    let re = if self.in_reply_to.is_empty() {
+                        ""
+                    } else {
+                        "Re: "
+                    };
+                    format!("{}{}", re, chat.name)
+                } else {
+                    match chat.param.get(Param::LastSubject) {
+                        Some(last_subject) => {
+                            let subject_start = if last_subject.starts_with("Chat:") {
+                                0
+                            } else {
+                                // "Antw:" is the longest abbreviation in
+                                // https://en.wikipedia.org/wiki/List_of_email_subject_abbreviations#Abbreviations_in_other_languages,
+                                // so look at the first _5_ characters:
+                                match last_subject.chars().take(5).position(|c| c == ':') {
+                                    Some(prefix_end) => prefix_end + 1,
+                                    None => 0,
+                                }
+                            };
+                            format!(
+                                "Re: {}",
+                                last_subject
+                                    .chars()
+                                    .skip(subject_start)
+                                    .collect::<String>()
+                                    .trim()
+                            )
+                        }
+                        None => {
+                            let self_name = match self.context.get_config(Config::Displayname).await
+                            {
+                                Some(name) => name,
+                                None => self
+                                    .context
+                                    .get_config(Config::Addr)
+                                    .await
+                                    .unwrap_or_default(),
+                            };
 
-                        let afwd_email = self.msg.param.exists(Param::Forwarded);
-                        let fwd = if afwd_email { "Fwd: " } else { "" };
-
-                        if self.msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage {
-                            // do not add the "Chat:" prefix for setup messages
                             self.context
-                                .stock_str(StockMessage::AcSetupMsgSubject)
-                                .into_owned()
-                        } else if chat.typ == Chattype::Group || chat.typ == Chattype::VerifiedGroup
-                        {
-                            format!("Chat: {}: {}{}", chat.name, fwd, raw_subject)
-                        } else {
-                            format!("Chat: {}{}", fwd, raw_subject)
+                                .stock_string_repl_str(
+                                    StockMessage::SubjectForNewContact,
+                                    self_name,
+                                )
+                                .await
                         }
                     }
-                    None => String::new(),
                 }
             }
-            Loaded::MDN => {
-                let e = self.context.stock_str(StockMessage::ReadRcpt);
-                format!("Chat: {}", e)
-            }
+            Loaded::MDN { .. } => self
+                .context
+                .stock_str(StockMessage::ReadRcpt)
+                .await
+                .into_owned(),
         }
     }
 
-    pub fn render(mut self) -> Result<RenderedEmail, Error> {
+    pub fn recipients(&self) -> Vec<String> {
+        self.recipients
+            .iter()
+            .map(|(_, addr)| addr.clone())
+            .collect()
+    }
+
+    pub async fn render(mut self) -> Result<RenderedEmail, Error> {
         // Headers that are encrypted
         // - Chat-*, except Chat-Version
         // - Secure-Join*
@@ -405,10 +424,8 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             self.from_addr.clone(),
         );
 
-        let mut to = Vec::with_capacity(self.recipients_names.len());
-        let name_iter = self.recipients_names.iter();
-        let addr_iter = self.recipients_addr.iter();
-        for (name, addr) in name_iter.zip(addr_iter) {
+        let mut to = Vec::new();
+        for (name, addr) in self.recipients.iter() {
             if name.is_empty() {
                 to.push(Address::new_mailbox(addr.clone()));
             } else {
@@ -418,6 +435,12 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                 ));
             }
         }
+
+        if to.is_empty() {
+            to.push(from.clone());
+        }
+
+        unprotected_headers.push(Header::new("MIME-Version".into(), "1.0".into()));
 
         if !self.references.is_empty() {
             unprotected_headers.push(Header::new("References".into(), self.references.clone()));
@@ -451,6 +474,13 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         ));
         unprotected_headers.push(Header::new("Chat-Version".to_string(), "1.0".to_string()));
 
+        if let Loaded::MDN { .. } = self.loaded {
+            unprotected_headers.push(Header::new(
+                "Auto-Submitted".to_string(),
+                "auto-replied".to_string(),
+            ));
+        }
+
         if self.req_mdn {
             // we use "Chat-Disposition-Notification-To"
             // because replies to "Disposition-Notification-To" are weird in many cases
@@ -464,20 +494,21 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         let min_verified = self.min_verified();
         let grpimage = self.grpimage();
         let force_plaintext = self.should_force_plaintext();
-        let subject_str = self.subject_str();
-        let e2ee_guranteed = self.is_e2ee_guranteed();
-        let mut encrypt_helper = EncryptHelper::new(self.context)?;
+        let subject_str = self.subject_str().await;
+        let e2ee_guaranteed = self.is_e2ee_guaranteed();
+        let encrypt_helper = EncryptHelper::new(self.context).await?;
 
         let subject = encode_words(&subject_str);
 
         let mut message = match self.loaded {
-            Loaded::Message => {
-                self.render_message(&mut protected_headers, &mut unprotected_headers, &grpimage)?
+            Loaded::Message { .. } => {
+                self.render_message(&mut protected_headers, &mut unprotected_headers, &grpimage)
+                    .await?
             }
-            Loaded::MDN => self.render_mdn()?,
+            Loaded::MDN { .. } => self.render_mdn().await?,
         };
 
-        if force_plaintext != DC_FP_NO_AUTOCRYPT_HEADER {
+        if force_plaintext != ForcePlaintext::NoAutocryptHeader as i32 {
             // unless determined otherwise we add the Autocrypt header
             let aheader = encrypt_helper.get_aheader().to_string();
             unprotected_headers.push(Header::new("Autocrypt".into(), aheader));
@@ -485,14 +516,14 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         protected_headers.push(Header::new("Subject".into(), subject));
 
-        let peerstates = self.peerstates_for_recipients()?;
+        let peerstates = self.peerstates_for_recipients().await?;
         let should_encrypt =
-            encrypt_helper.should_encrypt(self.context, e2ee_guranteed, &peerstates)?;
+            encrypt_helper.should_encrypt(self.context, e2ee_guaranteed, &peerstates)?;
         let is_encrypted = should_encrypt && force_plaintext == 0;
 
         let rfc724_mid = match self.loaded {
-            Loaded::Message => self.msg.rfc724_mid.clone(),
-            Loaded::MDN => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
+            Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
+            Loaded::MDN { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
         };
 
         // we could also store the message-id in the protected headers
@@ -513,7 +544,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         let outer_message = if is_encrypted {
             // Add gossip headers in chats with multiple recipients
-            if peerstates.len() > 1 && self.should_do_gossip() {
+            if peerstates.len() > 1 && self.should_do_gossip().await {
                 for peerstate in peerstates.iter().filter_map(|(state, _)| state.as_ref()) {
                     if peerstate.peek_key(min_verified).is_some() {
                         if let Some(header) = peerstate.render_gossip_header(min_verified) {
@@ -561,8 +592,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                 println!("{}", raw_message);
             }
 
-            let encrypted =
-                encrypt_helper.encrypt(self.context, min_verified, message, &peerstates)?;
+            let encrypted = encrypt_helper
+                .encrypt(self.context, min_verified, message, peerstates)
+                .await?;
 
             outer_message = outer_message
                 .child(
@@ -601,11 +633,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         };
 
         let MimeFactory {
-            recipients_addr,
-            from_addr,
             last_added_location_id,
-            msg,
-            loaded,
             ..
         } = self;
 
@@ -615,28 +643,65 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             is_encrypted,
             is_gossiped,
             last_added_location_id,
-            foreign_id: match loaded {
-                Loaded::Message => Some(msg.id),
-                Loaded::MDN => None,
-            },
-            recipients: recipients_addr,
-            from: from_addr,
             rfc724_mid,
         })
     }
 
-    fn render_message(
+    fn get_message_kml_part(&self) -> Option<PartBuilder> {
+        let latitude = self.msg.param.get_float(Param::SetLatitude)?;
+        let longitude = self.msg.param.get_float(Param::SetLongitude)?;
+
+        let kml_file = location::get_message_kml(self.msg.timestamp_sort, latitude, longitude);
+        let part = PartBuilder::new()
+            .content_type(
+                &"application/vnd.google-earth.kml+xml"
+                    .parse::<mime::Mime>()
+                    .unwrap(),
+            )
+            .header((
+                "Content-Disposition",
+                "attachment; filename=\"message.kml\"",
+            ))
+            .body(kml_file);
+        Some(part)
+    }
+
+    async fn get_location_kml_part(&mut self) -> Result<PartBuilder, Error> {
+        let (kml_content, last_added_location_id) =
+            location::get_kml(self.context, self.msg.chat_id).await?;
+        let part = PartBuilder::new()
+            .content_type(
+                &"application/vnd.google-earth.kml+xml"
+                    .parse::<mime::Mime>()
+                    .unwrap(),
+            )
+            .header((
+                "Content-Disposition",
+                "attachment; filename=\"location.kml\"",
+            ))
+            .body(kml_content);
+        if !self.msg.param.exists(Param::SetLatitude) {
+            // otherwise, the independent location is already filed
+            self.last_added_location_id = last_added_location_id;
+        }
+        Ok(part)
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    async fn render_message(
         &mut self,
         protected_headers: &mut Vec<Header>,
         unprotected_headers: &mut Vec<Header>,
         grpimage: &Option<String>,
     ) -> Result<PartBuilder, Error> {
         let context = self.context;
-        let chat = self.chat.as_ref().unwrap();
+        let chat = match &self.loaded {
+            Loaded::Message { chat } => chat,
+            Loaded::MDN { .. } => bail!("Attempt to render MDN as a message"),
+        };
         let command = self.msg.param.get_cmd();
         let mut placeholdertext = None;
         let mut meta_part = None;
-        let mut add_compatibility_header = false;
 
         if chat.typ == Chattype::VerifiedGroup {
             protected_headers.push(Header::new("Chat-Verified".to_string(), "1".to_string()));
@@ -666,7 +731,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                             email_to_add.into(),
                         ));
                     }
-                    if 0 != self.msg.param.get_int(Param::Arg2).unwrap_or_default() & 0x1 {
+                    if 0 != self.msg.param.get_int(Param::Arg2).unwrap_or_default()
+                        & DC_FROM_HANDSHAKE
+                    {
                         info!(
                             context,
                             "sending secure-join message \'{}\' >>>>>>>>>>>>>>>>>>>>>>>>>",
@@ -677,7 +744,6 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                             "vg-member-added".to_string(),
                         ));
                     }
-                    add_compatibility_header = true;
                 }
                 SystemMessage::GroupNameChanged => {
                     let value_to_add = self.msg.param.get(Param::Arg).unwrap_or_default();
@@ -698,7 +764,6 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                             "0".to_string(),
                         ));
                     }
-                    add_compatibility_header = true;
                 }
                 _ => {}
             }
@@ -718,6 +783,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                 placeholdertext = Some(
                     self.context
                         .stock_str(StockMessage::AcSetupMsgBody)
+                        .await
                         .to_string(),
                 );
             }
@@ -761,34 +827,23 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         if let Some(grpimage) = grpimage {
             info!(self.context, "setting group image '{}'", grpimage);
             let mut meta = Message::default();
-            meta.type_0 = Viewtype::Image;
+            meta.viewtype = Viewtype::Image;
             meta.param.set(Param::File, grpimage);
 
-            let (mail, filename_as_sent) = build_body_file(context, &meta, "group-image")?;
+            let (mail, filename_as_sent) = build_body_file(context, &meta, "group-image").await?;
             meta_part = Some(mail);
-            protected_headers.push(Header::new(
-                "Chat-Group-Avatar".into(),
-                filename_as_sent.clone(),
-            ));
-
-            // add the old group-image headers for versions <=0.973 resp. <=beta.15 (december 2019)
-            // image deletion is not supported in the compatibility layer.
-            // this can be removed some time after releasing 1.0,
-            // grep for #DeprecatedAvatar to get the place where compatibility parsing takes place.
-            if add_compatibility_header {
-                protected_headers.push(Header::new("Chat-Group-Image".into(), filename_as_sent));
-            }
+            protected_headers.push(Header::new("Chat-Group-Avatar".into(), filename_as_sent));
         }
 
-        if self.msg.type_0 == Viewtype::Sticker {
+        if self.msg.viewtype == Viewtype::Sticker {
             protected_headers.push(Header::new("Chat-Content".into(), "sticker".into()));
         }
 
-        if self.msg.type_0 == Viewtype::Voice
-            || self.msg.type_0 == Viewtype::Audio
-            || self.msg.type_0 == Viewtype::Video
+        if self.msg.viewtype == Viewtype::Voice
+            || self.msg.viewtype == Viewtype::Audio
+            || self.msg.viewtype == Viewtype::Video
         {
-            if self.msg.type_0 == Viewtype::Voice {
+            if self.msg.viewtype == Viewtype::Voice {
                 protected_headers.push(Header::new("Chat-Voice-Message".into(), "1".into()));
             }
             let duration_ms = self.msg.param.get_int(Param::Duration).unwrap_or_default();
@@ -828,7 +883,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         let message_text = format!(
             "{}{}{}{}{}",
             fwdhint.unwrap_or_default(),
-            &final_text,
+            escape_message_footer_marks(final_text),
             if !final_text.is_empty() && !footer.is_empty() {
                 "\r\n\r\n"
             } else {
@@ -839,19 +894,20 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         );
 
         // Message is sent as text/plain, with charset = utf-8
-        let mut parts = vec![PartBuilder::new()
+        let main_part = PartBuilder::new()
             .content_type(&mime::TEXT_PLAIN_UTF_8)
-            .body(message_text)];
+            .body(message_text);
+        let mut parts = Vec::new();
 
         // add attachment part
-        if chat::msgtype_has_file(self.msg.type_0) {
-            if !is_file_size_okay(context, &self.msg) {
+        if chat::msgtype_has_file(self.msg.viewtype) {
+            if !is_file_size_okay(context, &self.msg).await {
                 bail!(
                     "Message exceeds the recommended {} MB.",
-                    24 * 1024 * 1024 / 4 * 3 / 1000 / 1000,
+                    RECOMMENDED_FILE_SIZE / 1_000_000,
                 );
             } else {
-                let (file_part, _) = build_body_file(context, &self.msg, "")?;
+                let (file_part, _) = build_body_file(context, &self.msg, "").await?;
                 parts.push(file_part);
             }
         }
@@ -860,58 +916,22 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             parts.push(meta_part);
         }
 
-        if self.msg.param.exists(Param::SetLatitude) {
-            let param = &self.msg.param;
-            let kml_file = location::get_message_kml(
-                self.msg.timestamp_sort,
-                param.get_float(Param::SetLatitude).unwrap_or_default(),
-                param.get_float(Param::SetLongitude).unwrap_or_default(),
-            );
-            parts.push(
-                PartBuilder::new()
-                    .content_type(
-                        &"application/vnd.google-earth.kml+xml"
-                            .parse::<mime::Mime>()
-                            .unwrap(),
-                    )
-                    .header((
-                        "Content-Disposition",
-                        "attachment; filename=\"message.kml\"",
-                    ))
-                    .body(kml_file),
-            );
+        if let Some(msg_kml_part) = self.get_message_kml_part() {
+            parts.push(msg_kml_part);
         }
 
-        if location::is_sending_locations_to_chat(context, self.msg.chat_id) {
-            match location::get_kml(context, self.msg.chat_id) {
-                Ok((kml_content, last_added_location_id)) => {
-                    parts.push(
-                        PartBuilder::new()
-                            .content_type(
-                                &"application/vnd.google-earth.kml+xml"
-                                    .parse::<mime::Mime>()
-                                    .unwrap(),
-                            )
-                            .header((
-                                "Content-Disposition",
-                                "attachment; filename=\"message.kml\"",
-                            ))
-                            .body(kml_content),
-                    );
-                    if !self.msg.param.exists(Param::SetLatitude) {
-                        // otherwise, the independent location is already filed
-                        self.last_added_location_id = last_added_location_id;
-                    }
-                }
+        if location::is_sending_locations_to_chat(context, self.msg.chat_id).await {
+            match self.get_location_kml_part().await {
+                Ok(part) => parts.push(part),
                 Err(err) => {
-                    warn!(context, "mimefactory: could not get location: {}", err);
+                    warn!(context, "mimefactory: could not send location: {}", err);
                 }
             }
         }
 
         if self.attach_selfavatar {
-            match context.get_config(Config::Selfavatar) {
-                Some(path) => match build_selfavatar_file(context, path) {
+            match context.get_config(Config::Selfavatar).await {
+                Some(path) => match build_selfavatar_file(context, &path) {
                     Ok((part, filename)) => {
                         parts.push(part);
                         protected_headers.push(Header::new("Chat-User-Avatar".into(), filename))
@@ -922,24 +942,24 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             }
         }
 
-        // Single part, render as regular message.
-        if parts.len() == 1 {
-            return Ok(parts.pop().unwrap());
+        if parts.is_empty() {
+            // Single part, render as regular message.
+            Ok(main_part)
+        } else {
+            // Multiple parts, render as multipart.
+            let mut message = PartBuilder::new().message_type(MimeMultipartType::Mixed);
+            message = message.child(main_part.build());
+            for part in parts.into_iter() {
+                message = message.child(part.build());
+            }
+            Ok(message)
         }
-
-        // Multiple parts, render as multipart.
-        let mut message = PartBuilder::new().message_type(MimeMultipartType::Mixed);
-        for part in parts.into_iter() {
-            message = message.child(part.build());
-        }
-
-        Ok(message)
     }
 
     /// Render an MDN
-    fn render_mdn(&mut self) -> Result<PartBuilder, Error> {
+    async fn render_mdn(&mut self) -> Result<PartBuilder, Error> {
         // RFC 6522, this also requires the `report-type` parameter which is equal
-        // to the MIME subtype of the second body part of the multipart/report */
+        // to the MIME subtype of the second body part of the multipart/report
         //
         // currently, we do not send MDNs encrypted:
         // - in a multi-device-setup that is not set up properly, MDNs would disturb the communication as they
@@ -949,6 +969,13 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         // - in older versions, we did not encrypt messages to ourself when they to to SMTP - however, if these messages
         //   are forwarded for any reasons (eg. gmail always forwards to IMAP), we have no chance to decrypt them;
         //   this issue is fixed with 0.9.4
+
+        let additional_msg_ids = match &self.loaded {
+            Loaded::Message { .. } => bail!("Attempt to render a message as MDN"),
+            Loaded::MDN {
+                additional_msg_ids, ..
+            } => additional_msg_ids,
+        };
 
         let mut message = PartBuilder::new().header((
             "Content-Type".to_string(),
@@ -965,13 +992,15 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         {
             self.context
                 .stock_str(StockMessage::EncryptedMsg)
+                .await
                 .into_owned()
         } else {
-            self.msg.get_summarytext(self.context, 32)
+            self.msg.get_summarytext(self.context, 32).await
         };
         let p2 = self
             .context
-            .stock_string_repl_str(StockMessage::ReadRcptMailBody, p1);
+            .stock_string_repl_str(StockMessage::ReadRcptMailBody, p1)
+            .await;
         let message_text = format!("{}\r\n", p2);
         message = message.child(
             PartBuilder::new()
@@ -991,10 +1020,22 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             version, self.from_addr, self.from_addr, self.msg.rfc724_mid
         );
 
+        let extension_fields = if additional_msg_ids.is_empty() {
+            "".to_string()
+        } else {
+            "Additional-Message-IDs: ".to_string()
+                + &additional_msg_ids
+                    .iter()
+                    .map(|mid| render_rfc724_mid(&mid))
+                    .collect::<Vec<String>>()
+                    .join(" ")
+                + "\r\n"
+        };
+
         message = message.child(
             PartBuilder::new()
                 .content_type(&"message/disposition-notification".parse().unwrap())
-                .body(message_text2)
+                .body(message_text2 + &extension_fields)
                 .build(),
         );
 
@@ -1016,14 +1057,15 @@ fn wrapped_base64_encode(buf: &[u8]) -> String {
         .join("\r\n")
 }
 
-fn build_body_file(
+async fn build_body_file(
     context: &Context,
     msg: &Message,
     base_name: &str,
 ) -> Result<(PartBuilder, String), Error> {
     let blob = msg
         .param
-        .get_blob(Param::File, context, true)?
+        .get_blob(Param::File, context, true)
+        .await?
         .ok_or_else(|| format_err!("msg has no filename"))?;
     let suffix = blob.suffix().unwrap_or("dat");
 
@@ -1031,7 +1073,7 @@ fn build_body_file(
     // not transfer the original filenames eg. for images; these names
     // are normally not needed and contain timestamps, running numbers
     // etc.
-    let filename_to_send: String = match msg.type_0 {
+    let filename_to_send: String = match msg.viewtype {
         Viewtype::Voice => chrono::Utc
             .timestamp(msg.timestamp_sort as i64, 0)
             .format(&format!("voice-message_%Y-%m-%d_%H-%M-%S.{}", &suffix))
@@ -1087,7 +1129,7 @@ fn build_body_file(
     Ok((mail, filename_to_send))
 }
 
-fn build_selfavatar_file(context: &Context, path: String) -> Result<(PartBuilder, String), Error> {
+fn build_selfavatar_file(context: &Context, path: &str) -> Result<(PartBuilder, String), Error> {
     let blob = BlobObject::from_path(context, path)?;
     let filename_to_send = match blob.suffix() {
         Some(suffix) => format!("avatar.{}", suffix),
@@ -1112,21 +1154,18 @@ fn build_selfavatar_file(context: &Context, path: String) -> Result<(PartBuilder
     Ok((part, filename_to_send))
 }
 
-pub(crate) fn vec_contains_lowercase(vec: &[String], part: &str) -> bool {
-    let partlc = part.to_lowercase();
-    for cur in vec.iter() {
-        if cur.to_lowercase() == partlc {
-            return true;
-        }
-    }
-    false
+fn recipients_contain_addr(recipients: &[(String, String)], addr: &str) -> bool {
+    let addr_lc = addr.to_lowercase();
+    recipients
+        .iter()
+        .any(|(_, cur)| cur.to_lowercase() == addr_lc)
 }
 
-fn is_file_size_okay(context: &Context, msg: &Message) -> bool {
+async fn is_file_size_okay(context: &Context, msg: &Message) -> bool {
     match msg.param.get_path(Param::File, context).unwrap_or(None) {
         Some(path) => {
-            let bytes = dc_get_filebytes(context, &path);
-            bytes <= (49 * 1024 * 1024 / 4 * 3)
+            let bytes = dc_get_filebytes(context, &path).await;
+            bytes <= UPPER_LIMIT_FILE_SIZE
         }
         None => false,
     }
@@ -1135,7 +1174,7 @@ fn is_file_size_okay(context: &Context, msg: &Message) -> bool {
 fn render_rfc724_mid(rfc724_mid: &str) -> String {
     let rfc724_mid = rfc724_mid.trim().to_string();
 
-    if rfc724_mid.chars().nth(0).unwrap_or_default() == '<' {
+    if rfc724_mid.chars().next().unwrap_or_default() == '<' {
         rfc724_mid
     } else {
         format!("<{}>", rfc724_mid)
@@ -1160,20 +1199,19 @@ fn encode_words(word: &str) -> String {
 }
 
 pub fn needs_encoding(to_check: impl AsRef<str>) -> bool {
-    let to_check = to_check.as_ref();
-
-    if to_check.is_empty() {
-        return false;
-    }
-
-    to_check.chars().any(|c| {
-        !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.' && c != '~' && c != '%'
+    !to_check.as_ref().chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' || c == '%'
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chatlist::Chatlist;
+    use crate::dc_receive_imf::dc_receive_imf;
+    use crate::mimeparser::*;
+    use crate::test_utils::configured_offline_context;
+    use crate::test_utils::TestContext;
 
     #[test]
     fn test_render_email_address() {
@@ -1181,6 +1219,9 @@ mod tests {
         let addr = "x@y.org";
 
         assert!(!display_name.is_ascii());
+        assert!(!display_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' '));
 
         let s = format!(
             "{}",
@@ -1190,6 +1231,25 @@ mod tests {
         println!("{}", s);
 
         assert_eq!(s, "=?utf-8?q?=C3=A4_space?= <x@y.org>");
+    }
+
+    #[test]
+    fn test_render_email_address_noescape() {
+        let display_name = "a space";
+        let addr = "x@y.org";
+
+        assert!(display_name.is_ascii());
+        assert!(display_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' '));
+
+        let s = format!(
+            "{}",
+            Address::new_mailbox_with_name(display_name.to_string(), addr.to_string())
+        );
+
+        // Addresses should not be unnecessarily be encoded, see https://github.com/deltachat/deltachat-core-rust/issues/1575:
+        assert_eq!(s, "a space <x@y.org>");
     }
 
     #[test]
@@ -1225,5 +1285,201 @@ mod tests {
             "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU\r\n\
              FBQUFBQUFBQQ==";
         assert_eq!(wrapped_base64_encode(input), output);
+    }
+
+    #[test]
+    fn test_needs_encoding() {
+        assert!(!needs_encoding(""));
+        assert!(!needs_encoding("foobar"));
+        assert!(needs_encoding(" "));
+        assert!(needs_encoding("foo bar"));
+    }
+
+    #[async_std::test]
+    async fn test_subject() {
+        // 1.: Receive a mail from an MUA or Delta Chat
+        assert_eq!(
+            msg_to_subject_str(
+                b"From: Bob <bob@example.org>\n\
+                To: alice@example.org\n\
+                Subject: Antw: Chat: hello\n\
+                Message-ID: <2222@example.org>\n\
+                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+                \n\
+                hello\n"
+            )
+            .await,
+            "Re: Chat: hello"
+        );
+
+        assert_eq!(
+            msg_to_subject_str(
+                b"From: Bob <bob@example.org>\n\
+                To: alice@example.org\n\
+                Subject: Infos: 42\n\
+                Message-ID: <2222@example.org>\n\
+                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+                \n\
+                hello\n"
+            )
+            .await,
+            "Re: Infos: 42"
+        );
+
+        // 2. Receive a message from Delta Chat when we did not send any messages before
+        assert_eq!(
+            msg_to_subject_str(
+                b"From: Charlie <charlie@example.org>\n\
+                To: alice@example.org\n\
+                Subject: Chat: hello\n\
+                Chat-Version: 1.0\n\
+                Message-ID: <2223@example.org>\n\
+                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+                \n\
+                hello\n"
+            )
+            .await,
+            "Re: Chat: hello"
+        );
+
+        // 3. Send the first message to a new contact
+        let t = configured_offline_context().await;
+        assert_eq!(first_subject_str(t).await, "Message from alice@example.org");
+
+        let t = configured_offline_context().await;
+        t.ctx
+            .set_config(Config::Displayname, Some("Alice"))
+            .await
+            .unwrap();
+        assert_eq!(first_subject_str(t).await, "Message from Alice");
+
+        // 4. Receive messages with unicode characters and make sure that we do not panic (we do not care about the result)
+        msg_to_subject_str(
+            "From: Charlie <charlie@example.org>\n\
+            To: alice@example.org\n\
+            Subject: äääää\n\
+            Chat-Version: 1.0\n\
+            Message-ID: <2893@example.org>\n\
+            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+            \n\
+            hello\n"
+                .as_bytes(),
+        )
+        .await;
+
+        msg_to_subject_str(
+            "From: Charlie <charlie@example.org>\n\
+            To: alice@example.org\n\
+            Subject: aäääää\n\
+            Chat-Version: 1.0\n\
+            Message-ID: <2893@example.org>\n\
+            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+            \n\
+            hello\n"
+                .as_bytes(),
+        )
+        .await;
+    }
+
+    async fn first_subject_str(t: TestContext) -> String {
+        let contact_id =
+            Contact::add_or_lookup(&t.ctx, "Dave", "dave@example.org", Origin::ManuallyCreated)
+                .await
+                .unwrap()
+                .0;
+
+        let chat_id = chat::create_by_contact_id(&t.ctx, contact_id)
+            .await
+            .unwrap();
+
+        let mut new_msg = Message::new(Viewtype::Text);
+        new_msg.set_text(Some("Hi".to_string()));
+        new_msg.chat_id = chat_id;
+        chat::prepare_msg(&t.ctx, chat_id, &mut new_msg)
+            .await
+            .unwrap();
+
+        let mf = MimeFactory::from_msg(&t.ctx, &new_msg, false)
+            .await
+            .unwrap();
+
+        mf.subject_str().await
+    }
+
+    async fn msg_to_subject_str(imf_raw: &[u8]) -> String {
+        let t = configured_offline_context().await;
+        let new_msg = incoming_msg_to_reply_msg(imf_raw, &t.ctx).await;
+        let mf = MimeFactory::from_msg(&t.ctx, &new_msg, false)
+            .await
+            .unwrap();
+        mf.subject_str().await
+    }
+
+    // Creates a mimefactory for a message that replies "Hi" to the incoming message in `imf_raw`.
+    async fn incoming_msg_to_reply_msg(imf_raw: &[u8], context: &Context) -> Message {
+        context
+            .set_config(Config::ShowEmails, Some("2"))
+            .await
+            .unwrap();
+
+        dc_receive_imf(context, imf_raw, "INBOX", 1, false)
+            .await
+            .unwrap();
+
+        let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
+
+        let chat_id = chat::create_by_msg_id(context, chats.get_msg_id(0).unwrap())
+            .await
+            .unwrap();
+
+        let mut new_msg = Message::new(Viewtype::Text);
+        new_msg.set_text(Some("Hi".to_string()));
+        new_msg.chat_id = chat_id;
+        chat::prepare_msg(context, chat_id, &mut new_msg)
+            .await
+            .unwrap();
+
+        new_msg
+    }
+
+    #[async_std::test]
+    // This test could still be extended
+    async fn test_render_reply() {
+        let t = configured_offline_context().await;
+        let context = &t.ctx;
+
+        let msg = incoming_msg_to_reply_msg(
+            b"From: Charlie <charlie@example.org>\n\
+                To: alice@example.org\n\
+                Subject: Chat: hello\n\
+                Chat-Version: 1.0\n\
+                Message-ID: <2223@example.org>\n\
+                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+                \n\
+                hello\n",
+            context,
+        )
+        .await;
+
+        let mimefactory = MimeFactory::from_msg(&t.ctx, &msg, false).await.unwrap();
+
+        let recipients = mimefactory.recipients();
+        assert_eq!(recipients, vec!["charlie@example.org"]);
+
+        let rendered_msg = mimefactory.render().await.unwrap();
+
+        let mail = mailparse::parse_mail(&rendered_msg.message).unwrap();
+        assert_eq!(
+            mail.headers
+                .iter()
+                .find(|h| h.get_key() == "MIME-Version")
+                .unwrap()
+                .get_value(),
+            "1.0"
+        );
+
+        let _mime_msg = MimeMessage::from_bytes(context, &rendered_msg.message)
+            .await
+            .unwrap();
     }
 }

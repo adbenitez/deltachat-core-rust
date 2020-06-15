@@ -1,10 +1,64 @@
 //! # Events specification
 
-use std::path::PathBuf;
-
+use async_std::path::PathBuf;
+use async_std::sync::{channel, Receiver, Sender, TrySendError};
 use strum::EnumProperty;
 
+use crate::chat::ChatId;
 use crate::message::MsgId;
+
+#[derive(Debug)]
+pub struct Events {
+    receiver: Receiver<Event>,
+    sender: Sender<Event>,
+}
+
+impl Default for Events {
+    fn default() -> Self {
+        let (sender, receiver) = channel(1_000);
+
+        Self { receiver, sender }
+    }
+}
+
+impl Events {
+    pub fn emit(&self, event: Event) {
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(event)) => {
+                // when we are full, we pop remove the oldest event and push on the new one
+                let _ = self.receiver.try_recv();
+
+                // try again
+                self.emit(event);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                unreachable!("unable to emit event, channel disconnected");
+            }
+        }
+    }
+
+    /// Retrieve the event emitter.
+    pub fn get_emitter(&self) -> EventEmitter {
+        EventEmitter(self.receiver.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EventEmitter(Receiver<Event>);
+
+impl EventEmitter {
+    /// Blocking recv of an event. Return `None` if the `Sender` has been droped.
+    pub fn recv_sync(&self) -> Option<Event> {
+        async_std::task::block_on(self.recv())
+    }
+
+    /// Blocking async recv of an event. Return `None` if the `Sender` has been droped.
+    pub async fn recv(&self) -> Option<Event> {
+        // TODO: change once we can use async channels internally.
+        self.0.recv().await.ok()
+    }
+}
 
 impl Event {
     /// Returns the corresponding Event id.
@@ -107,36 +161,36 @@ pub enum Event {
     /// - Chats created, deleted or archived
     /// - A draft has been set
     #[strum(props(id = "2000"))]
-    MsgsChanged { chat_id: u32, msg_id: MsgId },
+    MsgsChanged { chat_id: ChatId, msg_id: MsgId },
 
     /// There is a fresh message. Typically, the user will show an notification
     /// when receiving this message.
     ///
     /// There is no extra #DC_EVENT_MSGS_CHANGED event send together with this event.
     #[strum(props(id = "2005"))]
-    IncomingMsg { chat_id: u32, msg_id: MsgId },
+    IncomingMsg { chat_id: ChatId, msg_id: MsgId },
 
     /// A single message is sent successfully. State changed from  DC_STATE_OUT_PENDING to
     /// DC_STATE_OUT_DELIVERED, see dc_msg_get_state().
     #[strum(props(id = "2010"))]
-    MsgDelivered { chat_id: u32, msg_id: MsgId },
+    MsgDelivered { chat_id: ChatId, msg_id: MsgId },
 
     /// A single message could not be sent. State changed from DC_STATE_OUT_PENDING or DC_STATE_OUT_DELIVERED to
     /// DC_STATE_OUT_FAILED, see dc_msg_get_state().
     #[strum(props(id = "2012"))]
-    MsgFailed { chat_id: u32, msg_id: MsgId },
+    MsgFailed { chat_id: ChatId, msg_id: MsgId },
 
     /// A single message is read by the receiver. State changed from DC_STATE_OUT_DELIVERED to
     /// DC_STATE_OUT_MDN_RCVD, see dc_msg_get_state().
     #[strum(props(id = "2015"))]
-    MsgRead { chat_id: u32, msg_id: MsgId },
+    MsgRead { chat_id: ChatId, msg_id: MsgId },
 
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
     /// Or the verify state of a chat has changed.
     /// See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
     /// and dc_remove_contact_from_chat().
     #[strum(props(id = "2020"))]
-    ChatModified(u32),
+    ChatModified(ChatId),
 
     /// Contact(s) created, renamed, blocked or deleted.
     ///
@@ -200,10 +254,4 @@ pub enum Event {
     ///     (Bob has verified alice and waits until Alice does the same for him)
     #[strum(props(id = "2061"))]
     SecurejoinJoinerProgress { contact_id: u32, progress: usize },
-
-    /// This event is sent out to the inviter when a joiner successfully joined a group.
-    /// @param data1 (int) chat_id
-    /// @param data2 (int) contact_id
-    #[strum(props(id = "2062"))]
-    SecurejoinMemberAdded { chat_id: u32, contact_id: u32 },
 }

@@ -1,303 +1,437 @@
 //! Cryptographic key module
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::Cursor;
-use std::path::Path;
 
-use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
+use async_trait::async_trait;
+use num_traits::FromPrimitive;
+use pgp::composed::Deserializable;
 use pgp::ser::Serialize;
 use pgp::types::{KeyTrait, SecretKeyTrait};
+use thiserror::Error;
 
+use crate::config::Config;
 use crate::constants::*;
 use crate::context::Context;
-use crate::dc_tools::*;
-use crate::sql::{self, Sql};
+use crate::dc_tools::{time, EmailAddress, InvalidEmailError};
+use crate::sql;
 
-/// Cryptographic key
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Key {
-    Public(SignedPublicKey),
-    Secret(SignedSecretKey),
+// Re-export key types
+pub use crate::pgp::KeyPair;
+pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
+
+/// Error type for deltachat key handling.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("Could not decode base64")]
+    Base64Decode(#[from] base64::DecodeError),
+    #[error("rPGP error: {}", _0)]
+    Pgp(#[from] pgp::errors::Error),
+    #[error("Failed to generate PGP key: {}", _0)]
+    Keygen(#[from] crate::pgp::PgpKeygenError),
+    #[error("Failed to load key: {}", _0)]
+    LoadKey(#[from] sql::Error),
+    #[error("Failed to save generated key: {}", _0)]
+    StoreKey(#[from] SaveKeyError),
+    #[error("No address configured")]
+    NoConfiguredAddr,
+    #[error("Configured address is invalid: {}", _0)]
+    InvalidConfiguredAddr(#[from] InvalidEmailError),
+    #[error("no data provided")]
+    Empty,
 }
 
-impl From<SignedPublicKey> for Key {
-    fn from(key: SignedPublicKey) -> Self {
-        Key::Public(key)
-    }
-}
+pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<SignedSecretKey> for Key {
-    fn from(key: SignedSecretKey) -> Self {
-        Key::Secret(key)
-    }
-}
+/// Convenience trait for working with keys.
+///
+/// This trait is implemented for rPGP's [SignedPublicKey] and
+/// [SignedSecretKey] types and makes working with them a little
+/// easier in the deltachat world.
+#[async_trait]
+pub trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
+    type KeyType: Serialize + Deserializable + KeyTrait + Clone;
 
-impl std::convert::TryFrom<Key> for SignedSecretKey {
-    type Error = ();
-
-    fn try_from(value: Key) -> Result<Self, Self::Error> {
-        match value {
-            Key::Public(_) => Err(()),
-            Key::Secret(key) => Ok(key),
-        }
-    }
-}
-
-impl<'a> std::convert::TryFrom<&'a Key> for &'a SignedSecretKey {
-    type Error = ();
-
-    fn try_from(value: &'a Key) -> Result<Self, Self::Error> {
-        match value {
-            Key::Public(_) => Err(()),
-            Key::Secret(key) => Ok(key),
-        }
-    }
-}
-
-impl std::convert::TryFrom<Key> for SignedPublicKey {
-    type Error = ();
-
-    fn try_from(value: Key) -> Result<Self, Self::Error> {
-        match value {
-            Key::Public(key) => Ok(key),
-            Key::Secret(_) => Err(()),
-        }
-    }
-}
-
-impl<'a> std::convert::TryFrom<&'a Key> for &'a SignedPublicKey {
-    type Error = ();
-
-    fn try_from(value: &'a Key) -> Result<Self, Self::Error> {
-        match value {
-            Key::Public(key) => Ok(key),
-            Key::Secret(_) => Err(()),
-        }
-    }
-}
-
-impl Key {
-    pub fn is_public(&self) -> bool {
-        match self {
-            Key::Public(_) => true,
-            Key::Secret(_) => false,
-        }
+    /// Create a key from some bytes.
+    fn from_slice(bytes: &[u8]) -> Result<Self::KeyType> {
+        Ok(<Self::KeyType as Deserializable>::from_bytes(Cursor::new(
+            bytes,
+        ))?)
     }
 
-    pub fn is_secret(&self) -> bool {
-        !self.is_public()
-    }
-
-    pub fn from_slice(bytes: &[u8], key_type: KeyType) -> Option<Self> {
-        if bytes.is_empty() {
-            return None;
-        }
-        let res: Result<Key, _> = match key_type {
-            KeyType::Public => SignedPublicKey::from_bytes(Cursor::new(bytes)).map(Into::into),
-            KeyType::Private => SignedSecretKey::from_bytes(Cursor::new(bytes)).map(Into::into),
-        };
-
-        match res {
-            Ok(key) => Some(key),
-            Err(err) => {
-                eprintln!("Invalid key bytes: {:?}", err);
-                None
-            }
-        }
-    }
-
-    pub fn from_armored_string(
-        data: &str,
-        key_type: KeyType,
-    ) -> Option<(Self, BTreeMap<String, String>)> {
-        let bytes = data.as_bytes();
-        let res: Result<(Key, _), _> = match key_type {
-            KeyType::Public => SignedPublicKey::from_armor_single(Cursor::new(bytes))
-                .map(|(k, h)| (Into::into(k), h)),
-            KeyType::Private => SignedSecretKey::from_armor_single(Cursor::new(bytes))
-                .map(|(k, h)| (Into::into(k), h)),
-        };
-
-        match res {
-            Ok(res) => Some(res),
-            Err(err) => {
-                eprintln!("Invalid key bytes: {:?}", err);
-                None
-            }
-        }
-    }
-
-    pub fn from_base64(encoded_data: &str, key_type: KeyType) -> Option<Self> {
+    /// Create a key from a base64 string.
+    fn from_base64(data: &str) -> Result<Self::KeyType> {
         // strip newlines and other whitespace
-        let cleaned: String = encoded_data.trim().split_whitespace().collect();
-        let bytes = cleaned.as_bytes();
-        base64::decode(bytes)
-            .ok()
-            .and_then(|decoded| Self::from_slice(&decoded, key_type))
+        let cleaned: String = data.trim().split_whitespace().collect();
+        let bytes = base64::decode(cleaned.as_bytes())?;
+        Self::from_slice(&bytes)
     }
 
-    pub fn from_self_public(
-        context: &Context,
-        self_addr: impl AsRef<str>,
-        sql: &Sql,
-    ) -> Option<Self> {
-        let addr = self_addr.as_ref();
-
-        sql.query_get_value(
-            context,
-            "SELECT public_key FROM keypairs WHERE addr=? AND is_default=1;",
-            &[addr],
-        )
-        .and_then(|blob: Vec<u8>| Self::from_slice(&blob, KeyType::Public))
+    /// Create a key from an ASCII-armored string.
+    ///
+    /// Returns the key and a map of any headers which might have been set in
+    /// the ASCII-armored representation.
+    fn from_asc(data: &str) -> Result<(Self::KeyType, BTreeMap<String, String>)> {
+        let bytes = data.as_bytes();
+        Self::KeyType::from_armor_single(Cursor::new(bytes)).map_err(Error::Pgp)
     }
 
-    pub fn from_self_private(
-        context: &Context,
-        self_addr: impl AsRef<str>,
-        sql: &Sql,
-    ) -> Option<Self> {
-        sql.query_get_value(
-            context,
-            "SELECT private_key FROM keypairs WHERE addr=? AND is_default=1;",
-            &[self_addr.as_ref()],
-        )
-        .and_then(|blob: Vec<u8>| Self::from_slice(&blob, KeyType::Private))
+    /// Load the users' default key from the database.
+    async fn load_self(context: &Context) -> Result<Self::KeyType>;
+
+    /// Serialise the key as bytes.
+    fn to_bytes(&self) -> Vec<u8> {
+        // Not using Serialize::to_bytes() to make clear *why* it is
+        // safe to ignore this error.
+        // Because we write to a Vec<u8> the io::Write impls never
+        // fail and we can hide this error.
+        let mut buf = Vec::new();
+        self.to_writer(&mut buf).unwrap();
+        buf
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            Key::Public(k) => k.to_bytes().unwrap_or_default(),
-            Key::Secret(k) => k.to_bytes().unwrap_or_default(),
+    /// Serialise the key to a base64 string.
+    fn to_base64(&self) -> String {
+        base64::encode(&DcKey::to_bytes(self))
+    }
+
+    /// Serialise the key to ASCII-armored representation.
+    ///
+    /// Each header line must be terminated by `\r\n`.  Only allows setting one
+    /// header as a simplification since that's the only way it's used so far.
+    // Since .to_armored_string() are actual methods on SignedPublicKey and
+    // SignedSecretKey we can not generically implement this.
+    fn to_asc(&self, header: Option<(&str, &str)>) -> String;
+
+    /// The fingerprint for the key.
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::new(KeyTrait::fingerprint(self)).expect("Invalid fingerprint from rpgp")
+    }
+}
+
+#[async_trait]
+impl DcKey for SignedPublicKey {
+    type KeyType = SignedPublicKey;
+
+    async fn load_self(context: &Context) -> Result<Self::KeyType> {
+        match context
+            .sql
+            .query_row(
+                r#"
+            SELECT public_key
+              FROM keypairs
+             WHERE addr=(SELECT value FROM config WHERE keyname="configured_addr")
+               AND is_default=1;
+            "#,
+                paramsv![],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .await
+        {
+            Ok(bytes) => Self::from_slice(&bytes),
+            Err(sql::Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => {
+                let keypair = generate_keypair(context).await?;
+                Ok(keypair.public)
+            }
+            Err(err) => Err(err.into()),
         }
     }
 
-    pub fn verify(&self) -> bool {
-        match self {
-            Key::Public(k) => k.verify().is_ok(),
-            Key::Secret(k) => k.verify().is_ok(),
-        }
-    }
-
-    pub fn to_base64(&self) -> String {
-        let buf = self.to_bytes();
-        base64::encode(&buf)
-    }
-
-    pub fn to_armored_string(
-        &self,
-        headers: Option<&BTreeMap<String, String>>,
-    ) -> pgp::errors::Result<String> {
-        match self {
-            Key::Public(k) => k.to_armored_string(headers),
-            Key::Secret(k) => k.to_armored_string(headers),
-        }
-    }
-
-    /// Each header line must be terminated by `\r\n`
-    pub fn to_asc(&self, header: Option<(&str, &str)>) -> String {
+    fn to_asc(&self, header: Option<(&str, &str)>) -> String {
+        // Not using .to_armored_string() to make clear *why* it is
+        // safe to ignore this error.
+        // Because we write to a Vec<u8> the io::Write impls never
+        // fail and we can hide this error.
         let headers = header.map(|(key, value)| {
             let mut m = BTreeMap::new();
             m.insert(key.to_string(), value.to_string());
             m
         });
-
-        self.to_armored_string(headers.as_ref())
-            .expect("failed to serialize key")
+        let mut buf = Vec::new();
+        self.to_armored_writer(&mut buf, headers.as_ref())
+            .unwrap_or_default();
+        std::string::String::from_utf8(buf).unwrap_or_default()
     }
+}
 
-    pub fn write_asc_to_file(
-        &self,
-        file: impl AsRef<Path>,
-        context: &Context,
-    ) -> std::io::Result<()> {
-        let file_content = self.to_asc(None).into_bytes();
+#[async_trait]
+impl DcKey for SignedSecretKey {
+    type KeyType = SignedSecretKey;
 
-        let res = dc_write_file(context, &file, &file_content);
-        if res.is_err() {
-            error!(context, "Cannot write key to {}", file.as_ref().display());
-        }
-        res
-    }
-
-    pub fn fingerprint(&self) -> String {
-        match self {
-            Key::Public(k) => hex::encode_upper(k.fingerprint()),
-            Key::Secret(k) => hex::encode_upper(k.fingerprint()),
-        }
-    }
-
-    pub fn formatted_fingerprint(&self) -> String {
-        let rawhex = self.fingerprint();
-        dc_format_fingerprint(&rawhex)
-    }
-
-    pub fn split_key(&self) -> Option<Key> {
-        match self {
-            Key::Public(_) => None,
-            Key::Secret(k) => {
-                let pub_key = k.public_key();
-                pub_key.sign(k, || "".into()).map(Key::Public).ok()
+    async fn load_self(context: &Context) -> Result<Self::KeyType> {
+        match context
+            .sql
+            .query_row(
+                r#"
+            SELECT private_key
+              FROM keypairs
+             WHERE addr=(SELECT value FROM config WHERE keyname="configured_addr")
+               AND is_default=1;
+            "#,
+                paramsv![],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .await
+        {
+            Ok(bytes) => Self::from_slice(&bytes),
+            Err(sql::Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => {
+                let keypair = generate_keypair(context).await?;
+                Ok(keypair.secret)
             }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn to_asc(&self, header: Option<(&str, &str)>) -> String {
+        // Not using .to_armored_string() to make clear *why* it is
+        // safe to do these unwraps.
+        // Because we write to a Vec<u8> the io::Write impls never
+        // fail and we can hide this error.  The string is always ASCII.
+        let headers = header.map(|(key, value)| {
+            let mut m = BTreeMap::new();
+            m.insert(key.to_string(), value.to_string());
+            m
+        });
+        let mut buf = Vec::new();
+        self.to_armored_writer(&mut buf, headers.as_ref())
+            .unwrap_or_default();
+        std::string::String::from_utf8(buf).unwrap_or_default()
+    }
+}
+
+/// Deltachat extension trait for secret keys.
+///
+/// Provides some convenience wrappers only applicable to [SignedSecretKey].
+pub trait DcSecretKey {
+    /// Create a public key from a private one.
+    fn split_public_key(&self) -> Result<SignedPublicKey>;
+}
+
+impl DcSecretKey for SignedSecretKey {
+    fn split_public_key(&self) -> Result<SignedPublicKey> {
+        self.verify()?;
+        let unsigned_pubkey = SecretKeyTrait::public_key(self);
+        let signed_pubkey = unsigned_pubkey.sign(self, || "".into())?;
+        Ok(signed_pubkey)
+    }
+}
+
+async fn generate_keypair(context: &Context) -> Result<KeyPair> {
+    let addr = context
+        .get_config(Config::ConfiguredAddr)
+        .await
+        .ok_or_else(|| Error::NoConfiguredAddr)?;
+    let addr = EmailAddress::new(&addr)?;
+    let _guard = context.generating_key_mutex.lock().await;
+
+    // Check if the key appeared while we were waiting on the lock.
+    match context
+        .sql
+        .query_row(
+            r#"
+        SELECT public_key, private_key
+          FROM keypairs
+         WHERE addr=?1
+           AND is_default=1;
+        "#,
+            paramsv![addr],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .await
+    {
+        Ok((pub_bytes, sec_bytes)) => Ok(KeyPair {
+            addr,
+            public: SignedPublicKey::from_slice(&pub_bytes)?,
+            secret: SignedSecretKey::from_slice(&sec_bytes)?,
+        }),
+        Err(sql::Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => {
+            let start = std::time::Instant::now();
+            let keytype = KeyGenType::from_i32(context.get_config_int(Config::KeyGenType).await)
+                .unwrap_or_default();
+            info!(context, "Generating keypair with type {}", keytype);
+            let keypair =
+                async_std::task::spawn_blocking(move || crate::pgp::create_keypair(addr, keytype))
+                    .await?;
+            store_self_keypair(context, &keypair, KeyPairUse::Default).await?;
+            info!(
+                context,
+                "Keypair generated in {:.3}s.",
+                start.elapsed().as_secs()
+            );
+            Ok(keypair)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Use of a [KeyPair] for encryption or decryption.
+///
+/// This is used by [store_self_keypair] to know what kind of key is
+/// being saved.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum KeyPairUse {
+    /// The default key used to encrypt new messages.
+    Default,
+    /// Only used to decrypt existing message.
+    ReadOnly,
+}
+
+/// Error saving a keypair to the database.
+#[derive(Debug, thiserror::Error)]
+#[error("SaveKeyError: {message}")]
+pub struct SaveKeyError {
+    message: String,
+    #[source]
+    cause: anyhow::Error,
+}
+
+impl SaveKeyError {
+    fn new(message: impl Into<String>, cause: impl Into<anyhow::Error>) -> Self {
+        Self {
+            message: message.into(),
+            cause: cause.into(),
         }
     }
 }
 
-pub fn dc_key_save_self_keypair(
+/// Store the keypair as an owned keypair for addr in the database.
+///
+/// This will save the keypair as keys for the given address.  The
+/// "self" here refers to the fact that this DC instance owns the
+/// keypair.  Usually `addr` will be [Config::ConfiguredAddr].
+///
+/// If either the public or private keys are already present in the
+/// database, this entry will be removed first regardless of the
+/// address associated with it.  Practically this means saving the
+/// same key again overwrites it.
+///
+/// [Config::ConfiguredAddr]: crate::config::Config::ConfiguredAddr
+pub async fn store_self_keypair(
     context: &Context,
-    public_key: &Key,
-    private_key: &Key,
-    addr: impl AsRef<str>,
-    is_default: bool,
-    sql: &Sql,
-) -> bool {
-    sql::execute(
-        context,
-        sql,
-        "INSERT INTO keypairs (addr, is_default, public_key, private_key, created) VALUES (?,?,?,?,?);",
-        params![addr.as_ref(), is_default as i32, public_key.to_bytes(), private_key.to_bytes(), time()],
-    ).is_ok()
+    keypair: &KeyPair,
+    default: KeyPairUse,
+) -> std::result::Result<(), SaveKeyError> {
+    // Everything should really be one transaction, more refactoring
+    // is needed for that.
+    let public_key = DcKey::to_bytes(&keypair.public);
+    let secret_key = DcKey::to_bytes(&keypair.secret);
+    context
+        .sql
+        .execute(
+            "DELETE FROM keypairs WHERE public_key=? OR private_key=?;",
+            paramsv![public_key, secret_key],
+        )
+        .await
+        .map_err(|err| SaveKeyError::new("failed to remove old use of key", err))?;
+    if default == KeyPairUse::Default {
+        context
+            .sql
+            .execute("UPDATE keypairs SET is_default=0;", paramsv![])
+            .await
+            .map_err(|err| SaveKeyError::new("failed to clear default", err))?;
+    }
+    let is_default = match default {
+        KeyPairUse::Default => true as i32,
+        KeyPairUse::ReadOnly => false as i32,
+    };
+
+    let addr = keypair.addr.to_string();
+    let t = time();
+
+    let params = paramsv![addr, is_default, public_key, secret_key, t];
+    context
+        .sql
+        .execute(
+            "INSERT INTO keypairs (addr, is_default, public_key, private_key, created)
+                VALUES (?,?,?,?,?);",
+            params,
+        )
+        .await
+        .map_err(|err| SaveKeyError::new("failed to insert keypair", err))?;
+
+    Ok(())
 }
 
-/// Make a fingerprint human-readable, in hex format.
-pub fn dc_format_fingerprint(fingerprint: &str) -> String {
-    // split key into chunks of 4 with space, and 20 newline
-    let mut res = String::new();
+/// A key fingerprint
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct Fingerprint(Vec<u8>);
 
-    for (i, c) in fingerprint.chars().enumerate() {
-        if i > 0 && i % 20 == 0 {
-            res += "\n";
-        } else if i > 0 && i % 4 == 0 {
-            res += " ";
+impl Fingerprint {
+    pub fn new(v: Vec<u8>) -> std::result::Result<Fingerprint, FingerprintError> {
+        match v.len() {
+            20 => Ok(Fingerprint(v)),
+            _ => Err(FingerprintError::WrongLength),
         }
-
-        res += &c.to_string();
     }
 
-    res
+    /// Make a hex string from the fingerprint.
+    ///
+    /// Use [std::fmt::Display] or [ToString::to_string] to get a
+    /// human-readable formatted string.
+    pub fn hex(&self) -> String {
+        hex::encode_upper(&self.0)
+    }
 }
 
-/// Bring a human-readable or otherwise formatted fingerprint back to the 40-characters-uppercase-hex format.
-pub fn dc_normalize_fingerprint(fp: &str) -> String {
-    fp.to_uppercase()
-        .chars()
-        .filter(|&c| c >= '0' && c <= '9' || c >= 'A' && c <= 'F')
-        .collect()
+/// Make a human-readable fingerprint.
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Split key into chunks of 4 with space and newline at 20 chars
+        for (i, c) in self.hex().chars().enumerate() {
+            if i > 0 && i % 20 == 0 {
+                writeln!(f)?;
+            } else if i > 0 && i % 4 == 0 {
+                write!(f, " ")?;
+            }
+            write!(f, "{}", c)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse a human-readable or otherwise formatted fingerprint.
+impl std::str::FromStr for Fingerprint {
+    type Err = FingerprintError;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        let hex_repr: String = input
+            .to_uppercase()
+            .chars()
+            .filter(|&c| c >= '0' && c <= '9' || c >= 'A' && c <= 'F')
+            .collect();
+        let v: Vec<u8> = hex::decode(hex_repr)?;
+        let fp = Fingerprint::new(v)?;
+        Ok(fp)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FingerprintError {
+    #[error("Invalid hex characters")]
+    NotHex(#[from] hex::FromHexError),
+    #[error("Incorrect fingerprint lengths")]
+    WrongLength,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
 
-    #[test]
-    fn test_normalize_fingerprint() {
-        let fingerprint = dc_normalize_fingerprint(" 1234  567890 \n AbcD abcdef ABCDEF ");
+    use std::error::Error;
 
-        assert_eq!(fingerprint, "1234567890ABCDABCDEFABCDEF");
+    use async_std::sync::Arc;
+    use lazy_static::lazy_static;
+
+    lazy_static! {
+        static ref KEYPAIR: KeyPair = alice_keypair();
     }
 
     #[test]
     fn test_from_armored_string() {
-        let (private_key, _) = Key::from_armored_string(
+        let (private_key, _) = SignedSecretKey::from_asc(
             "-----BEGIN PGP PRIVATE KEY BLOCK-----
 
 xcLYBF0fgz4BCADnRUV52V4xhSsU56ZaAn3+3oG86MZhXy4X8w14WZZDf0VJGeTh
@@ -355,72 +489,212 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 7yPJeQ==
 =KZk/
 -----END PGP PRIVATE KEY BLOCK-----",
-            KeyType::Private,
         )
-        .expect("failed to decode"); // NOTE: if you take out the ===GU1/ part, everything passes!
-        let binary = private_key.to_bytes();
-        Key::from_slice(&binary, KeyType::Private).expect("invalid private key");
+        .expect("failed to decode");
+        let binary = DcKey::to_bytes(&private_key);
+        SignedSecretKey::from_slice(&binary).expect("invalid private key");
     }
 
     #[test]
-    fn test_format_fingerprint() {
-        let fingerprint = dc_format_fingerprint("1234567890ABCDABCDEFABCDEF1234567890ABCD");
+    fn test_asc_roundtrip() {
+        let key = KEYPAIR.public.clone();
+        let asc = key.to_asc(Some(("spam", "ham")));
+        let (key2, hdrs) = SignedPublicKey::from_asc(&asc).unwrap();
+        assert_eq!(key, key2);
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs.get("spam"), Some(&String::from("ham")));
 
-        assert_eq!(
-            fingerprint,
-            "1234 5678 90AB CDAB CDEF\nABCD EF12 3456 7890 ABCD"
-        );
+        let key = KEYPAIR.secret.clone();
+        let asc = key.to_asc(Some(("spam", "ham")));
+        let (key2, hdrs) = SignedSecretKey::from_asc(&asc).unwrap();
+        assert_eq!(key, key2);
+        assert_eq!(hdrs.len(), 1);
+        assert_eq!(hdrs.get("spam"), Some(&String::from("ham")));
     }
 
     #[test]
-    #[ignore] // is too expensive
     fn test_from_slice_roundtrip() {
-        let (public_key, private_key) = crate::pgp::create_keypair("hello").unwrap();
+        let public_key = KEYPAIR.public.clone();
+        let private_key = KEYPAIR.secret.clone();
 
-        let binary = public_key.to_bytes();
-        let public_key2 = Key::from_slice(&binary, KeyType::Public).expect("invalid public key");
+        let binary = DcKey::to_bytes(&public_key);
+        let public_key2 = SignedPublicKey::from_slice(&binary).expect("invalid public key");
         assert_eq!(public_key, public_key2);
 
-        let binary = private_key.to_bytes();
-        let private_key2 = Key::from_slice(&binary, KeyType::Private).expect("invalid private key");
+        let binary = DcKey::to_bytes(&private_key);
+        let private_key2 = SignedSecretKey::from_slice(&binary).expect("invalid private key");
         assert_eq!(private_key, private_key2);
     }
 
     #[test]
     fn test_from_slice_bad_data() {
         let mut bad_data: [u8; 4096] = [0; 4096];
-
         for i in 0..4096 {
             bad_data[i] = (i & 0xff) as u8;
         }
-
         for j in 0..(4096 / 40) {
-            let bad_key = Key::from_slice(
-                &bad_data[j..j + 4096 / 2 + j],
-                if 0 != j & 1 {
-                    KeyType::Public
-                } else {
-                    KeyType::Private
-                },
-            );
-            assert!(bad_key.is_none());
+            let slice = &bad_data[j..j + 4096 / 2 + j];
+            assert!(SignedPublicKey::from_slice(slice).is_err());
+            assert!(SignedSecretKey::from_slice(slice).is_err());
         }
     }
 
     #[test]
-    #[ignore] // is too expensive
-    fn test_ascii_roundtrip() {
-        let (public_key, private_key) = crate::pgp::create_keypair("hello").unwrap();
+    fn test_base64_roundtrip() {
+        let key = KEYPAIR.public.clone();
+        let base64 = key.to_base64();
+        let key2 = SignedPublicKey::from_base64(&base64).unwrap();
+        assert_eq!(key, key2);
+    }
 
-        let s = public_key.to_armored_string(None).unwrap();
-        let (public_key2, _) =
-            Key::from_armored_string(&s, KeyType::Public).expect("invalid public key");
-        assert_eq!(public_key, public_key2);
+    #[async_std::test]
+    async fn test_load_self_existing() {
+        let alice = alice_keypair();
+        let t = dummy_context().await;
+        configure_alice_keypair(&t.ctx).await;
+        let pubkey = SignedPublicKey::load_self(&t.ctx).await.unwrap();
+        assert_eq!(alice.public, pubkey);
+        let seckey = SignedSecretKey::load_self(&t.ctx).await.unwrap();
+        assert_eq!(alice.secret, seckey);
+    }
 
-        let s = private_key.to_armored_string(None).unwrap();
-        println!("{}", &s);
-        let (private_key2, _) =
-            Key::from_armored_string(&s, KeyType::Private).expect("invalid private key");
-        assert_eq!(private_key, private_key2);
+    #[async_std::test]
+    async fn test_load_self_generate_public() {
+        let t = dummy_context().await;
+        t.ctx
+            .set_config(Config::ConfiguredAddr, Some("alice@example.com"))
+            .await
+            .unwrap();
+        let key = SignedPublicKey::load_self(&t.ctx).await;
+        assert!(key.is_ok());
+    }
+
+    #[async_std::test]
+    async fn test_load_self_generate_secret() {
+        let t = dummy_context().await;
+        t.ctx
+            .set_config(Config::ConfiguredAddr, Some("alice@example.com"))
+            .await
+            .unwrap();
+        let key = SignedSecretKey::load_self(&t.ctx).await;
+        assert!(key.is_ok());
+    }
+
+    #[async_std::test]
+    async fn test_load_self_generate_concurrent() {
+        use std::thread;
+
+        let t = dummy_context().await;
+        t.ctx
+            .set_config(Config::ConfiguredAddr, Some("alice@example.com"))
+            .await
+            .unwrap();
+        let ctx = t.ctx.clone();
+        let ctx0 = ctx.clone();
+        let thr0 =
+            thread::spawn(move || async_std::task::block_on(SignedPublicKey::load_self(&ctx0)));
+        let ctx1 = ctx.clone();
+        let thr1 =
+            thread::spawn(move || async_std::task::block_on(SignedPublicKey::load_self(&ctx1)));
+        let res0 = thr0.join().unwrap();
+        let res1 = thr1.join().unwrap();
+        assert_eq!(res0.unwrap(), res1.unwrap());
+    }
+
+    #[test]
+    fn test_split_key() {
+        let pubkey = KEYPAIR.secret.split_public_key().unwrap();
+        assert_eq!(pubkey.primary_key, KEYPAIR.public.primary_key);
+    }
+
+    #[async_std::test]
+    async fn test_save_self_key_twice() {
+        // Saving the same key twice should result in only one row in
+        // the keypairs table.
+        let t = dummy_context().await;
+        let ctx = Arc::new(t.ctx);
+
+        let ctx1 = ctx.clone();
+        let nrows = || async {
+            ctx1.sql
+                .query_get_value::<u32>(&ctx1, "SELECT COUNT(*) FROM keypairs;", paramsv![])
+                .await
+                .unwrap()
+        };
+        assert_eq!(nrows().await, 0);
+        store_self_keypair(&ctx, &KEYPAIR, KeyPairUse::Default)
+            .await
+            .unwrap();
+        assert_eq!(nrows().await, 1);
+        store_self_keypair(&ctx, &KEYPAIR, KeyPairUse::Default)
+            .await
+            .unwrap();
+        assert_eq!(nrows().await, 1);
+    }
+
+    // Convenient way to create a new key if you need one, run with
+    // `cargo test key::tests::gen_key`.
+    // #[test]
+    // fn gen_key() {
+    //     let name = "fiona";
+    //     let keypair = crate::pgp::create_keypair(
+    //         EmailAddress::new(&format!("{}@example.net", name)).unwrap(),
+    //     )
+    //     .unwrap();
+    //     std::fs::write(
+    //         format!("test-data/key/{}-public.asc", name),
+    //         keypair.public.to_base64(),
+    //     )
+    //     .unwrap();
+    //     std::fs::write(
+    //         format!("test-data/key/{}-secret.asc", name),
+    //         keypair.secret.to_base64(),
+    //     )
+    //     .unwrap();
+    // }
+
+    #[test]
+    fn test_fingerprint_from_str() {
+        let res = Fingerprint::new(vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ])
+        .unwrap();
+
+        let fp: Fingerprint = "0102030405060708090A0B0c0d0e0F1011121314".parse().unwrap();
+        assert_eq!(fp, res);
+
+        let fp: Fingerprint = "zzzz 0102 0304 0506\n0708090a0b0c0D0E0F1011121314 yyy"
+            .parse()
+            .unwrap();
+        assert_eq!(fp, res);
+
+        let err = "1".parse::<Fingerprint>().err().unwrap();
+        match err {
+            FingerprintError::NotHex(_) => (),
+            _ => panic!("Wrong error"),
+        }
+        let src_err = err.source().unwrap().downcast_ref::<hex::FromHexError>();
+        assert_eq!(src_err, Some(&hex::FromHexError::OddLength));
+    }
+
+    #[test]
+    fn test_fingerprint_hex() {
+        let fp = Fingerprint::new(vec![
+            1, 2, 4, 8, 16, 32, 64, 128, 255, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ])
+        .unwrap();
+        assert_eq!(fp.hex(), "0102040810204080FF0A0B0C0D0E0F1011121314");
+    }
+
+    #[test]
+    fn test_fingerprint_to_string() {
+        let fp = Fingerprint::new(vec![
+            1, 2, 4, 8, 16, 32, 64, 128, 255, 1, 2, 4, 8, 16, 32, 64, 128, 255, 19, 20,
+        ])
+        .unwrap();
+        assert_eq!(
+            fp.to_string(),
+            "0102 0408 1020 4080 FF01\n0204 0810 2040 80FF 1314"
+        );
     }
 }

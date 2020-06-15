@@ -4,12 +4,14 @@ use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
 use crate::blob::BlobObject;
+use crate::chat::ChatId;
 use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
 use crate::dc_tools::*;
-use crate::job::*;
-use crate::stock::StockMessage;
-use rusqlite::NO_PARAMS;
+use crate::events::Event;
+use crate::message::MsgId;
+use crate::mimefactory::RECOMMENDED_FILE_SIZE;
+use crate::{scheduler::InterruptInfo, stock::StockMessage};
 
 /// The available configuration keys.
 #[derive(
@@ -61,6 +63,31 @@ pub enum Config {
     #[strum(props(default = "0"))] // also change ShowEmails.default() on changes
     ShowEmails,
 
+    #[strum(props(default = "0"))] // also change MediaQuality.default() on changes
+    MediaQuality,
+
+    #[strum(props(default = "0"))]
+    KeyGenType,
+
+    /// Timer in seconds after which the message is deleted from the
+    /// server.
+    ///
+    /// Equals to 0 by default, which means the message is never
+    /// deleted.
+    ///
+    /// Value 1 is treated as "delete at once": messages are deleted
+    /// immediately, without moving to DeltaChat folder.
+    #[strum(props(default = "0"))]
+    DeleteServerAfter,
+
+    /// Timer in seconds after which the message is deleted from the
+    /// device.
+    ///
+    /// Equals to 0 by default, which means the message is never
+    /// deleted.
+    #[strum(props(default = "0"))]
+    DeleteDeviceAfter,
+
     SaveMimeHeaders,
     ConfiguredAddr,
     ConfiguredMailServer,
@@ -77,6 +104,9 @@ pub enum Config {
     ConfiguredServerFlags,
     ConfiguredSendSecurity,
     ConfiguredE2EEEnabled,
+    ConfiguredInboxFolder,
+    ConfiguredMvboxFolder,
+    ConfiguredSentboxFolder,
     Configured,
 
     #[strum(serialize = "sys.version")]
@@ -91,16 +121,16 @@ pub enum Config {
 
 impl Context {
     /// Get a configuration key. Returns `None` if no value is set, and no default value found.
-    pub fn get_config(&self, key: Config) -> Option<String> {
+    pub async fn get_config(&self, key: Config) -> Option<String> {
         let value = match key {
             Config::Selfavatar => {
-                let rel_path = self.sql.get_raw_config(self, key);
+                let rel_path = self.sql.get_raw_config(self, key).await;
                 rel_path.map(|p| dc_get_abs_path(self, &p).to_string_lossy().into_owned())
             }
             Config::SysVersion => Some((&*DC_VERSION_STR).clone()),
-            Config::SysMsgsizeMaxRecommended => Some(format!("{}", 24 * 1024 * 1024 / 4 * 3)),
+            Config::SysMsgsizeMaxRecommended => Some(format!("{}", RECOMMENDED_FILE_SIZE)),
             Config::SysConfigKeys => Some(get_config_keys_string()),
-            _ => self.sql.get_raw_config(self, key),
+            _ => self.sql.get_raw_config(self, key).await,
         };
 
         if value.is_some() {
@@ -109,65 +139,104 @@ impl Context {
 
         // Default values
         match key {
-            Config::Selfstatus => Some(self.stock_str(StockMessage::StatusLine).into_owned()),
+            Config::Selfstatus => Some(self.stock_str(StockMessage::StatusLine).await.into_owned()),
+            Config::ConfiguredInboxFolder => Some("INBOX".to_owned()),
             _ => key.get_str("default").map(|s| s.to_string()),
         }
     }
 
-    pub fn get_config_int(&self, key: Config) -> i32 {
+    pub async fn get_config_int(&self, key: Config) -> i32 {
         self.get_config(key)
+            .await
             .and_then(|s| s.parse().ok())
             .unwrap_or_default()
     }
 
-    pub fn get_config_bool(&self, key: Config) -> bool {
-        self.get_config_int(key) != 0
+    pub async fn get_config_bool(&self, key: Config) -> bool {
+        self.get_config_int(key).await != 0
+    }
+
+    /// Gets configured "delete_server_after" value.
+    ///
+    /// `None` means never delete the message, `Some(0)` means delete
+    /// at once, `Some(x)` means delete after `x` seconds.
+    pub async fn get_config_delete_server_after(&self) -> Option<i64> {
+        match self.get_config_int(Config::DeleteServerAfter).await {
+            0 => None,
+            1 => Some(0),
+            x => Some(x as i64),
+        }
+    }
+
+    /// Gets configured "delete_device_after" value.
+    ///
+    /// `None` means never delete the message, `Some(x)` means delete
+    /// after `x` seconds.
+    pub async fn get_config_delete_device_after(&self) -> Option<i64> {
+        match self.get_config_int(Config::DeleteDeviceAfter).await {
+            0 => None,
+            x => Some(x as i64),
+        }
     }
 
     /// Set the given config key.
     /// If `None` is passed as a value the value is cleared and set to the default if there is one.
-    pub fn set_config(&self, key: Config, value: Option<&str>) -> crate::sql::Result<()> {
+    pub async fn set_config(&self, key: Config, value: Option<&str>) -> crate::sql::Result<()> {
         match key {
             Config::Selfavatar => {
                 self.sql
-                    .execute("UPDATE contacts SET selfavatar_sent=0;", NO_PARAMS)?;
+                    .execute("UPDATE contacts SET selfavatar_sent=0;", paramsv![])
+                    .await?;
                 self.sql
-                    .set_raw_config_bool(self, "attach_selfavatar", true)?;
+                    .set_raw_config_bool(self, "attach_selfavatar", true)
+                    .await?;
                 match value {
                     Some(value) => {
-                        let blob = BlobObject::new_from_path(&self, value)?;
+                        let blob = BlobObject::new_from_path(&self, value).await?;
                         blob.recode_to_avatar_size(self)?;
-                        self.sql.set_raw_config(self, key, Some(blob.as_name()))
+                        self.sql
+                            .set_raw_config(self, key, Some(blob.as_name()))
+                            .await
                     }
-                    None => self.sql.set_raw_config(self, key, None),
+                    None => self.sql.set_raw_config(self, key, None).await,
                 }
             }
             Config::InboxWatch => {
-                let ret = self.sql.set_raw_config(self, key, value);
-                interrupt_inbox_idle(self);
+                let ret = self.sql.set_raw_config(self, key, value).await;
+                self.interrupt_inbox(InterruptInfo::new(false, None)).await;
                 ret
             }
             Config::SentboxWatch => {
-                let ret = self.sql.set_raw_config(self, key, value);
-                interrupt_sentbox_idle(self);
+                let ret = self.sql.set_raw_config(self, key, value).await;
+                self.interrupt_sentbox(InterruptInfo::new(false, None))
+                    .await;
                 ret
             }
             Config::MvboxWatch => {
-                let ret = self.sql.set_raw_config(self, key, value);
-                interrupt_mvbox_idle(self);
+                let ret = self.sql.set_raw_config(self, key, value).await;
+                self.interrupt_mvbox(InterruptInfo::new(false, None)).await;
                 ret
             }
             Config::Selfstatus => {
-                let def = self.stock_str(StockMessage::StatusLine);
+                let def = self.stock_str(StockMessage::StatusLine).await;
                 let val = if value.is_none() || value.unwrap() == def {
                     None
                 } else {
                     value
                 };
 
-                self.sql.set_raw_config(self, key, val)
+                self.sql.set_raw_config(self, key, val).await
             }
-            _ => self.sql.set_raw_config(self, key, value),
+            Config::DeleteDeviceAfter => {
+                let ret = self.sql.set_raw_config(self, key, value).await;
+                // Force chatlist reload to delete old messages immediately.
+                self.emit_event(Event::MsgsChanged {
+                    msg_id: MsgId::new(0),
+                    chat_id: ChatId::new(0),
+                });
+                ret
+            }
+            _ => self.sql.set_raw_config(self, key, value).await,
         }
     }
 }
@@ -190,7 +259,11 @@ mod tests {
     use std::str::FromStr;
     use std::string::ToString;
 
+    use crate::constants;
+    use crate::constants::AVATAR_SIZE;
     use crate::test_utils::*;
+    use image::GenericImageView;
+    use num_traits::FromPrimitive;
     use std::fs::File;
     use std::io::Write;
 
@@ -211,33 +284,102 @@ mod tests {
         assert_eq!(Config::ImapFolder.get_str("default"), Some("INBOX"));
     }
 
-    #[test]
-    fn test_selfavatar_outside_blobdir() -> failure::Fallible<()> {
-        let t = dummy_context();
+    #[async_std::test]
+    async fn test_selfavatar_outside_blobdir() {
+        let t = dummy_context().await;
         let avatar_src = t.dir.path().join("avatar.jpg");
         let avatar_bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
-        File::create(&avatar_src)?.write_all(avatar_bytes)?;
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
         let avatar_blob = t.ctx.get_blobdir().join("avatar.jpg");
-        assert!(!avatar_blob.exists());
+        assert!(!avatar_blob.exists().await);
         t.ctx
-            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))?;
-        assert!(avatar_blob.exists());
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(avatar_blob.exists().await);
         assert!(std::fs::metadata(&avatar_blob).unwrap().len() < avatar_bytes.len() as u64);
-        let avatar_cfg = t.ctx.get_config(Config::Selfavatar);
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar).await;
         assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
-        Ok(())
+
+        let img = image::open(avatar_src).unwrap();
+        assert_eq!(img.width(), 1000);
+        assert_eq!(img.height(), 1000);
+
+        let img = image::open(avatar_blob).unwrap();
+        assert_eq!(img.width(), AVATAR_SIZE);
+        assert_eq!(img.height(), AVATAR_SIZE);
     }
 
-    #[test]
-    fn test_selfavatar_in_blobdir() -> failure::Fallible<()> {
-        let t = dummy_context();
-        let avatar_src = t.ctx.get_blobdir().join("avatar.jpg");
-        let avatar_bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
-        File::create(&avatar_src)?.write_all(avatar_bytes)?;
+    #[async_std::test]
+    async fn test_selfavatar_in_blobdir() {
+        let t = dummy_context().await;
+        let avatar_src = t.ctx.get_blobdir().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar900x900.png");
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
+
+        let img = image::open(&avatar_src).unwrap();
+        assert_eq!(img.width(), 900);
+        assert_eq!(img.height(), 900);
+
         t.ctx
-            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))?;
-        let avatar_cfg = t.ctx.get_config(Config::Selfavatar);
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .await
+            .unwrap();
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar).await;
         assert_eq!(avatar_cfg, avatar_src.to_str().map(|s| s.to_string()));
-        Ok(())
+
+        let img = image::open(avatar_src).unwrap();
+        assert_eq!(img.width(), AVATAR_SIZE);
+        assert_eq!(img.height(), AVATAR_SIZE);
+    }
+
+    #[async_std::test]
+    async fn test_selfavatar_copy_without_recode() {
+        let t = dummy_context().await;
+        let avatar_src = t.dir.path().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        File::create(&avatar_src)
+            .unwrap()
+            .write_all(avatar_bytes)
+            .unwrap();
+        let avatar_blob = t.ctx.get_blobdir().join("avatar.png");
+        assert!(!avatar_blob.exists().await);
+        t.ctx
+            .set_config(Config::Selfavatar, Some(&avatar_src.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(avatar_blob.exists().await);
+        assert_eq!(
+            std::fs::metadata(&avatar_blob).unwrap().len(),
+            avatar_bytes.len() as u64
+        );
+        let avatar_cfg = t.ctx.get_config(Config::Selfavatar).await;
+        assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
+    }
+
+    #[async_std::test]
+    async fn test_media_quality_config_option() {
+        let t = dummy_context().await;
+        let media_quality = t.ctx.get_config_int(Config::MediaQuality).await;
+        assert_eq!(media_quality, 0);
+        let media_quality = constants::MediaQuality::from_i32(media_quality).unwrap_or_default();
+        assert_eq!(media_quality, constants::MediaQuality::Balanced);
+
+        t.ctx
+            .set_config(Config::MediaQuality, Some("1"))
+            .await
+            .unwrap();
+
+        let media_quality = t.ctx.get_config_int(Config::MediaQuality).await;
+        assert_eq!(media_quality, 1);
+        assert_eq!(constants::MediaQuality::Worse as i32, 1);
+        let media_quality = constants::MediaQuality::from_i32(media_quality).unwrap_or_default();
+        assert_eq!(media_quality, constants::MediaQuality::Worse);
     }
 }

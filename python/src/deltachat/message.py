@@ -16,8 +16,7 @@ class Message(object):
     """
     def __init__(self, account, dc_msg):
         self.account = account
-        self._dc_context = account._dc_context
-        assert isinstance(self._dc_context, ffi.CData)
+        assert isinstance(self.account._dc_context, ffi.CData)
         assert isinstance(dc_msg, ffi.CData)
         assert dc_msg != ffi.NULL
         self._dc_msg = dc_msg
@@ -28,7 +27,11 @@ class Message(object):
         return self.account == other.account and self.id == other.id
 
     def __repr__(self):
-        return "<Message id={} dc_context={}>".format(self.id, self._dc_context)
+        c = self.get_sender_contact()
+        typ = "outgoing" if self.is_outgoing() else "incoming"
+        return "<Message {} sys={} {} id={} sender={}/{} chat={}/{}>".format(
+            typ, self.is_system_message(), repr(self.text[:10]),
+            self.id, c.id, c.addr, self.chat.id, self.chat.get_name())
 
     @classmethod
     def from_db(cls, account, id):
@@ -49,6 +52,20 @@ class Message(object):
             lib.dc_msg_new(account._dc_context, view_type_code),
             lib.dc_msg_unref
         ))
+
+    def create_chat(self):
+        """ create or get an existing chat (group) object for this message.
+
+        If the message is a deaddrop contact request
+        the sender will become an accepted contact.
+
+        :returns: a :class:`deltachat.chat.Chat` object.
+        """
+        from .chat import Chat
+        chat_id = lib.dc_create_chat_by_msg_id(self.account._dc_context, self.id)
+        ctx = self.account._dc_context
+        self._dc_msg = ffi.gc(lib.dc_get_msg(ctx, self.id), lib.dc_msg_unref)
+        return Chat(self.account, chat_id)
 
     @props.with_doc
     def text(self):
@@ -81,6 +98,10 @@ class Message(object):
         """mime type of the file (if it exists)"""
         return from_dc_charpointer(lib.dc_msg_get_filemime(self._dc_msg))
 
+    def is_system_message(self):
+        """ return True if this message is a system/info message. """
+        return bool(lib.dc_msg_is_info(self._dc_msg))
+
     def is_setup_message(self):
         """ return True if this message is a setup message. """
         return lib.dc_msg_is_setupmessage(self._dc_msg)
@@ -102,12 +123,12 @@ class Message(object):
 
         The text is multiline and may contain eg. the raw text of the message.
         """
-        return from_dc_charpointer(lib.dc_get_msg_info(self._dc_context, self.id))
+        return from_dc_charpointer(lib.dc_get_msg_info(self.account._dc_context, self.id))
 
     def continue_key_transfer(self, setup_code):
         """ extract key and use it as primary key for this account. """
         res = lib.dc_continue_key_transfer(
-                self._dc_context,
+                self.account._dc_context,
                 self.id,
                 as_dc_charpointer(setup_code)
         )
@@ -142,7 +163,7 @@ class Message(object):
         :returns: email-mime message object (with headers only, no body).
         """
         import email.parser
-        mime_headers = lib.dc_get_mime_headers(self._dc_context, self.id)
+        mime_headers = lib.dc_get_mime_headers(self.account._dc_context, self.id)
         if mime_headers:
             s = ffi.string(ffi.gc(mime_headers, lib.dc_str_unref))
             if isinstance(s, bytes):
@@ -159,6 +180,13 @@ class Message(object):
         chat_id = lib.dc_msg_get_chat_id(self._dc_msg)
         return Chat(self.account, chat_id)
 
+    def get_sender_chat(self):
+        """return the 1:1 chat with the sender of this message.
+
+        :returns: :class:`deltachat.chat.Chat` instance
+        """
+        return self.get_sender_contact().get_chat()
+
     def get_sender_contact(self):
         """return the contact of who wrote the message.
 
@@ -166,7 +194,7 @@ class Message(object):
         """
         from .contact import Contact
         contact_id = lib.dc_msg_get_from_id(self._dc_msg)
-        return Contact(self._dc_context, contact_id)
+        return Contact(self.account, contact_id)
 
     #
     # Message State query methods
@@ -178,7 +206,7 @@ class Message(object):
         else:
             # load message from db to get a fresh/current state
             dc_msg = ffi.gc(
-                lib.dc_get_msg(self._dc_context, self.id),
+                lib.dc_get_msg(self.account._dc_context, self.id),
                 lib.dc_msg_unref
             )
         return lib.dc_msg_get_state(dc_msg)
@@ -206,6 +234,13 @@ class Message(object):
         are not counted as unread but were not marked as read nor resulted in MDNs.
         """
         return self._msgstate == const.DC_STATE_IN_SEEN
+
+    def is_outgoing(self):
+        """Return True if Message is outgoing. """
+        return self._msgstate in (
+            const.DC_STATE_OUT_PREPARING, const.DC_STATE_OUT_PENDING,
+            const.DC_STATE_OUT_FAILED, const.DC_STATE_OUT_MDN_RCVD,
+            const.DC_STATE_OUT_DELIVERED)
 
     def is_out_preparing(self):
         """Return True if Message is outgoing, but its file is being prepared.
@@ -269,6 +304,10 @@ class Message(object):
         """ return True if it's a file message. """
         return self._view_type == const.DC_MSG_FILE
 
+    def mark_seen(self):
+        """ mark this message as seen. """
+        self.account.mark_seen_messages([self.id])
+
 
 # some code for handling DC_MSG_* view types
 
@@ -288,3 +327,29 @@ def get_viewtype_code_from_name(view_type_name):
             return code
     raise ValueError("message typecode not found for {!r}, "
                      "available {!r}".format(view_type_name, list(_view_type_mapping.values())))
+
+
+#
+# some helper code for turning system messages into hook events
+#
+
+def map_system_message(msg):
+    if msg.is_system_message():
+        res = parse_system_add_remove(msg.text)
+        if res:
+            contact = msg.account.get_contact_by_addr(res[1])
+            if contact:
+                d = dict(chat=msg.chat, contact=contact, message=msg)
+                return "ac_member_" + res[0], d
+
+
+def parse_system_add_remove(text):
+    # Member Me (x@y) removed by a@b.
+    # Member x@y removed by a@b
+    text = text.lower()
+    parts = text.split()
+    if parts[0] == "member":
+        if parts[2] in ("removed", "added"):
+            return parts[2], parts[1]
+        if parts[3] in ("removed", "added"):
+            return parts[3], parts[2].strip("()")

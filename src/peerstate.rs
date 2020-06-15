@@ -1,15 +1,14 @@
 //! # [Autocrypt Peer State](https://autocrypt.org/level1.html#peer-state-management) module
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::fmt;
 
 use num_traits::FromPrimitive;
 
 use crate::aheader::*;
-use crate::chat::*;
-use crate::constants::*;
 use crate::context::Context;
-use crate::key::*;
-use crate::sql::{self, Sql};
+use crate::key::{DcKey, Fingerprint, SignedPublicKey};
+use crate::sql::Sql;
 
 #[derive(Debug)]
 pub enum PeerstateKeyType {
@@ -32,13 +31,13 @@ pub struct Peerstate<'a> {
     pub last_seen: i64,
     pub last_seen_autocrypt: i64,
     pub prefer_encrypt: EncryptPreference,
-    pub public_key: Option<Key>,
-    pub public_key_fingerprint: Option<String>,
-    pub gossip_key: Option<Key>,
+    pub public_key: Option<SignedPublicKey>,
+    pub public_key_fingerprint: Option<Fingerprint>,
+    pub gossip_key: Option<SignedPublicKey>,
     pub gossip_timestamp: i64,
-    pub gossip_key_fingerprint: Option<String>,
-    pub verified_key: Option<Key>,
-    pub verified_key_fingerprint: Option<String>,
+    pub gossip_key_fingerprint: Option<Fingerprint>,
+    pub verified_key: Option<SignedPublicKey>,
+    pub verified_key_fingerprint: Option<Fingerprint>,
     pub to_save: Option<ToSave>,
     pub degrade_event: Option<DegradeEvent>,
 }
@@ -144,12 +143,16 @@ impl<'a> Peerstate<'a> {
         res
     }
 
-    pub fn from_addr(context: &'a Context, _sql: &Sql, addr: &str) -> Option<Self> {
+    pub async fn from_addr(context: &'a Context, addr: &str) -> Option<Peerstate<'a>> {
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, verified_key, verified_key_fingerprint FROM acpeerstates  WHERE addr=? COLLATE NOCASE;";
-        Self::from_stmt(context, query, &[addr])
+        Self::from_stmt(context, query, paramsv![addr]).await
     }
 
-    pub fn from_fingerprint(context: &'a Context, _sql: &Sql, fingerprint: &str) -> Option<Self> {
+    pub async fn from_fingerprint(
+        context: &'a Context,
+        _sql: &Sql,
+        fingerprint: &Fingerprint,
+    ) -> Option<Peerstate<'a>> {
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, \
                      gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, \
                      verified_key, verified_key_fingerprint \
@@ -157,19 +160,15 @@ impl<'a> Peerstate<'a> {
                      WHERE public_key_fingerprint=? COLLATE NOCASE \
                      OR gossip_key_fingerprint=? COLLATE NOCASE  \
                      ORDER BY public_key_fingerprint=? DESC;";
-
-        Self::from_stmt(
-            context,
-            query,
-            params![fingerprint, fingerprint, fingerprint],
-        )
+        let fp = fingerprint.hex();
+        Self::from_stmt(context, query, paramsv![fp, fp, fp]).await
     }
 
-    fn from_stmt<P>(context: &'a Context, query: &str, params: P) -> Option<Self>
-    where
-        P: IntoIterator,
-        P::Item: rusqlite::ToSql,
-    {
+    async fn from_stmt(
+        context: &'a Context,
+        query: &str,
+        params: Vec<&dyn crate::ToSql>,
+    ) -> Option<Peerstate<'a>> {
         context
             .sql
             .query_row(query, params, |row| {
@@ -185,48 +184,34 @@ impl<'a> Peerstate<'a> {
                 res.prefer_encrypt = EncryptPreference::from_i32(row.get(3)?).unwrap_or_default();
                 res.gossip_timestamp = row.get(5)?;
 
-                res.public_key_fingerprint = row.get(7)?;
-                if res
-                    .public_key_fingerprint
-                    .as_ref()
-                    .map(|s| s.is_empty())
-                    .unwrap_or_default()
-                {
-                    res.public_key_fingerprint = None;
-                }
-                res.gossip_key_fingerprint = row.get(8)?;
-                if res
-                    .gossip_key_fingerprint
-                    .as_ref()
-                    .map(|s| s.is_empty())
-                    .unwrap_or_default()
-                {
-                    res.gossip_key_fingerprint = None;
-                }
-                res.verified_key_fingerprint = row.get(10)?;
-                if res
-                    .verified_key_fingerprint
-                    .as_ref()
-                    .map(|s| s.is_empty())
-                    .unwrap_or_default()
-                {
-                    res.verified_key_fingerprint = None;
-                }
+                res.public_key_fingerprint = row
+                    .get::<_, Option<String>>(7)?
+                    .map(|s| s.parse::<Fingerprint>())
+                    .transpose()?;
+                res.gossip_key_fingerprint = row
+                    .get::<_, Option<String>>(8)?
+                    .map(|s| s.parse::<Fingerprint>())
+                    .transpose()?;
+                res.verified_key_fingerprint = row
+                    .get::<_, Option<String>>(10)?
+                    .map(|s| s.parse::<Fingerprint>())
+                    .transpose()?;
                 res.public_key = row
                     .get(4)
                     .ok()
-                    .and_then(|blob: Vec<u8>| Key::from_slice(&blob, KeyType::Public));
+                    .and_then(|blob: Vec<u8>| SignedPublicKey::from_slice(&blob).ok());
                 res.gossip_key = row
                     .get(6)
                     .ok()
-                    .and_then(|blob: Vec<u8>| Key::from_slice(&blob, KeyType::Public));
+                    .and_then(|blob: Vec<u8>| SignedPublicKey::from_slice(&blob).ok());
                 res.verified_key = row
                     .get(9)
                     .ok()
-                    .and_then(|blob: Vec<u8>| Key::from_slice(&blob, KeyType::Public));
+                    .and_then(|blob: Vec<u8>| SignedPublicKey::from_slice(&blob).ok());
 
                 Ok(res)
             })
+            .await
             .ok()
     }
 
@@ -315,16 +300,44 @@ impl<'a> Peerstate<'a> {
                 self.recalc_fingerprint();
                 self.to_save = Some(ToSave::All)
             }
+
+            // This is non-standard.
+            //
+            // According to Autocrypt 1.1.0 gossip headers SHOULD NOT
+            // contain encryption preference, but we include it into
+            // Autocrypt-Gossip and apply it one way (from
+            // "nopreference" to "mutual").
+            //
+            // This is compatible to standard clients, because they
+            // can't distinguish it from the case where we have
+            // contacted the client in the past and received this
+            // preference via Autocrypt header.
+            if self.last_seen_autocrypt == 0
+                && self.prefer_encrypt == EncryptPreference::NoPreference
+                && gossip_header.prefer_encrypt == EncryptPreference::Mutual
+            {
+                self.prefer_encrypt = EncryptPreference::Mutual;
+                self.to_save = Some(ToSave::All);
+            }
         };
     }
 
     pub fn render_gossip_header(&self, min_verified: PeerstateVerifiedStatus) -> Option<String> {
         if let Some(key) = self.peek_key(min_verified) {
             // TODO: avoid cloning
+            let public_key = SignedPublicKey::try_from(key.clone()).ok()?;
             let header = Aheader::new(
                 self.addr.clone(),
-                key.clone(),
-                EncryptPreference::NoPreference,
+                public_key,
+                // Autocrypt 1.1.0 specification says that
+                // `prefer-encrypt` attribute SHOULD NOT be included,
+                // but we include it anyway to propagate encryption
+                // preference to new members in group chats.
+                if self.last_seen_autocrypt > 0 {
+                    self.prefer_encrypt
+                } else {
+                    EncryptPreference::NoPreference
+                },
             );
             Some(header.to_string())
         } else {
@@ -332,25 +345,29 @@ impl<'a> Peerstate<'a> {
         }
     }
 
-    pub fn peek_key(&self, min_verified: PeerstateVerifiedStatus) -> Option<&Key> {
-        if self.public_key.is_none() && self.gossip_key.is_none() && self.verified_key.is_none() {
-            return None;
+    pub fn take_key(mut self, min_verified: PeerstateVerifiedStatus) -> Option<SignedPublicKey> {
+        match min_verified {
+            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.take(),
+            PeerstateVerifiedStatus::Unverified => {
+                self.public_key.take().or_else(|| self.gossip_key.take())
+            }
         }
+    }
 
-        if min_verified != PeerstateVerifiedStatus::Unverified {
-            return self.verified_key.as_ref();
+    pub fn peek_key(&self, min_verified: PeerstateVerifiedStatus) -> Option<&SignedPublicKey> {
+        match min_verified {
+            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.as_ref(),
+            PeerstateVerifiedStatus::Unverified => self
+                .public_key
+                .as_ref()
+                .or_else(|| self.gossip_key.as_ref()),
         }
-        if self.public_key.is_some() {
-            return self.public_key.as_ref();
-        }
-
-        self.gossip_key.as_ref()
     }
 
     pub fn set_verified(
         &mut self,
         which_key: PeerstateKeyType,
-        fingerprint: &str,
+        fingerprint: &Fingerprint,
         verified: PeerstateVerifiedStatus,
     ) -> bool {
         if verified == PeerstateVerifiedStatus::BidirectVerified {
@@ -385,87 +402,81 @@ impl<'a> Peerstate<'a> {
         }
     }
 
-    pub fn save_to_db(&self, sql: &Sql, create: bool) -> crate::sql::Result<()> {
+    pub async fn save_to_db(&self, sql: &Sql, create: bool) -> crate::sql::Result<()> {
         if create {
-            sql::execute(
-                self.context,
-                sql,
+            sql.execute(
                 "INSERT INTO acpeerstates (addr) VALUES(?);",
-                params![self.addr],
-            )?;
+                paramsv![self.addr],
+            )
+            .await?;
         }
 
         if self.to_save == Some(ToSave::All) || create {
-            sql::execute(
-                self.context,
-                sql,
+            sql.execute(
                 "UPDATE acpeerstates \
                  SET last_seen=?, last_seen_autocrypt=?, prefer_encrypted=?, \
                  public_key=?, gossip_timestamp=?, gossip_key=?, public_key_fingerprint=?, gossip_key_fingerprint=?, \
                  verified_key=?, verified_key_fingerprint=? \
                  WHERE addr=?;",
-                params![
+                paramsv![
                     self.last_seen,
                     self.last_seen_autocrypt,
                     self.prefer_encrypt as i64,
                     self.public_key.as_ref().map(|k| k.to_bytes()),
                     self.gossip_timestamp,
                     self.gossip_key.as_ref().map(|k| k.to_bytes()),
-                    &self.public_key_fingerprint,
-                    &self.gossip_key_fingerprint,
+                    self.public_key_fingerprint.as_ref().map(|fp| fp.hex()),
+                    self.gossip_key_fingerprint.as_ref().map(|fp| fp.hex()),
                     self.verified_key.as_ref().map(|k| k.to_bytes()),
-                    &self.verified_key_fingerprint,
-                    &self.addr,
+                    self.verified_key_fingerprint.as_ref().map(|fp| fp.hex()),
+                    self.addr,
                 ],
-            )?;
-            reset_gossiped_timestamp(self.context, 0)?;
+            ).await?;
         } else if self.to_save == Some(ToSave::Timestamps) {
-            sql::execute(
-                self.context,
-                sql,
+            sql.execute(
                 "UPDATE acpeerstates SET last_seen=?, last_seen_autocrypt=?, gossip_timestamp=? \
                  WHERE addr=?;",
-                params![
+                paramsv![
                     self.last_seen,
                     self.last_seen_autocrypt,
                     self.gossip_timestamp,
-                    &self.addr
+                    self.addr
                 ],
-            )?;
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    pub fn has_verified_key(&self, fingerprints: &HashSet<String>) -> bool {
-        if self.verified_key.is_some() && self.verified_key_fingerprint.is_some() {
-            let vkc = self.verified_key_fingerprint.as_ref().unwrap();
-            if fingerprints.contains(vkc) {
-                return true;
-            }
+    pub fn has_verified_key(&self, fingerprints: &HashSet<Fingerprint>) -> bool {
+        if let Some(vkc) = &self.verified_key_fingerprint {
+            fingerprints.contains(vkc) && self.verified_key.is_some()
+        } else {
+            false
         }
+    }
+}
 
-        false
+impl From<crate::key::FingerprintError> for rusqlite::Error {
+    fn from(_source: crate::key::FingerprintError) -> Self {
+        Self::InvalidColumnType(0, "Invalid fingerprint".into(), rusqlite::types::Type::Text)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::*;
     use pretty_assertions::assert_eq;
-
     use tempfile::TempDir;
 
-    #[test]
-    fn test_peerstate_save_to_db() {
-        let ctx = crate::test_utils::dummy_context();
+    #[async_std::test]
+    async fn test_peerstate_save_to_db() {
+        let ctx = crate::test_utils::dummy_context().await;
         let addr = "hello@mail.com";
 
-        let pub_key = crate::key::Key::from_base64(
-            include_str!("../test-data/key/public.asc"),
-            KeyType::Public,
-        )
-        .unwrap();
+        let pub_key = alice_keypair().public;
 
         let mut peerstate = Peerstate {
             context: &ctx.ctx,
@@ -485,11 +496,12 @@ mod tests {
         };
 
         assert!(
-            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            peerstate.save_to_db(&ctx.ctx.sql, true).await.is_ok(),
             "failed to save to db"
         );
 
-        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr)
+        let peerstate_new = Peerstate::from_addr(&ctx.ctx, addr)
+            .await
             .expect("failed to load peerstate from db");
 
         // clear to_save, as that is not persissted
@@ -497,20 +509,16 @@ mod tests {
         assert_eq!(peerstate, peerstate_new);
         let peerstate_new2 =
             Peerstate::from_fingerprint(&ctx.ctx, &ctx.ctx.sql, &pub_key.fingerprint())
+                .await
                 .expect("failed to load peerstate from db");
         assert_eq!(peerstate, peerstate_new2);
     }
 
-    #[test]
-    fn test_peerstate_double_create() {
-        let ctx = crate::test_utils::dummy_context();
+    #[async_std::test]
+    async fn test_peerstate_double_create() {
+        let ctx = crate::test_utils::dummy_context().await;
         let addr = "hello@mail.com";
-
-        let pub_key = crate::key::Key::from_base64(
-            include_str!("../test-data/key/public.asc"),
-            KeyType::Public,
-        )
-        .unwrap();
+        let pub_key = alice_keypair().public;
 
         let peerstate = Peerstate {
             context: &ctx.ctx,
@@ -530,25 +538,21 @@ mod tests {
         };
 
         assert!(
-            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            peerstate.save_to_db(&ctx.ctx.sql, true).await.is_ok(),
             "failed to save"
         );
         assert!(
-            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            peerstate.save_to_db(&ctx.ctx.sql, true).await.is_ok(),
             "double-call with create failed"
         );
     }
 
-    #[test]
-    fn test_peerstate_with_empty_gossip_key_save_to_db() {
-        let ctx = crate::test_utils::dummy_context();
+    #[async_std::test]
+    async fn test_peerstate_with_empty_gossip_key_save_to_db() {
+        let ctx = crate::test_utils::dummy_context().await;
         let addr = "hello@mail.com";
 
-        let pub_key = crate::key::Key::from_base64(
-            include_str!("../test-data/key/public.asc"),
-            KeyType::Public,
-        )
-        .unwrap();
+        let pub_key = alice_keypair().public;
 
         let mut peerstate = Peerstate {
             context: &ctx.ctx,
@@ -568,11 +572,12 @@ mod tests {
         };
 
         assert!(
-            peerstate.save_to_db(&ctx.ctx.sql, true).is_ok(),
+            peerstate.save_to_db(&ctx.ctx.sql, true).await.is_ok(),
             "failed to save"
         );
 
-        let peerstate_new = Peerstate::from_addr(&ctx.ctx, &ctx.ctx.sql, addr)
+        let peerstate_new = Peerstate::from_addr(&ctx.ctx, addr)
+            .await
             .expect("failed to load peerstate from db");
 
         // clear to_save, as that is not persissted

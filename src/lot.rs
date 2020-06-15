@@ -1,5 +1,7 @@
 use deltachat_derive::{FromSql, ToSql};
 
+use crate::key::Fingerprint;
+
 /// An object containing a set of values.
 /// The meaning of the values is defined by the function returning the object.
 /// Lot objects are created
@@ -14,7 +16,7 @@ pub struct Lot {
     pub(crate) timestamp: i64,
     pub(crate) state: LotState,
     pub(crate) id: u32,
-    pub(crate) fingerprint: Option<String>,
+    pub(crate) fingerprint: Option<Fingerprint>,
     pub(crate) invitenumber: Option<String>,
     pub(crate) auth: Option<String>,
 }
@@ -40,11 +42,11 @@ impl Lot {
     }
 
     pub fn get_text1(&self) -> Option<&str> {
-        self.text1.as_ref().map(|s| s.as_str())
+        self.text1.as_deref()
     }
 
     pub fn get_text2(&self) -> Option<&str> {
-        self.text2.as_ref().map(|s| s.as_str())
+        self.text2.as_deref()
     }
 
     pub fn get_text1_meaning(&self) -> Meaning {
@@ -85,6 +87,9 @@ pub enum LotState {
 
     /// test1=formatted fingerprint
     QrFprWithoutAddr = 230,
+
+    /// text1=domain
+    QrAccount = 250,
 
     /// id=contact
     QrAddr = 320,

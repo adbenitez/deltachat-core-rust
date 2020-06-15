@@ -1,8 +1,9 @@
 //! # Constants
-#![allow(non_camel_case_types, dead_code)]
+#![allow(dead_code)]
 
 use deltachat_derive::*;
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 
 lazy_static! {
     pub static ref DC_VERSION_STR: String = env!("CARGO_PKG_VERSION").to_string();
@@ -15,7 +16,20 @@ const DC_SENTBOX_WATCH_DEFAULT: i32 = 1;
 const DC_MVBOX_WATCH_DEFAULT: i32 = 1;
 const DC_MVBOX_MOVE_DEFAULT: i32 = 1;
 
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[derive(
+    Debug,
+    Display,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    FromPrimitive,
+    ToPrimitive,
+    FromSql,
+    ToSql,
+    Serialize,
+    Deserialize,
+)]
 #[repr(u8)]
 pub enum Blocked {
     Not = 0,
@@ -43,15 +57,43 @@ impl Default for ShowEmails {
     }
 }
 
-pub const DC_IMAP_SEEN: u32 = 0x1;
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[repr(u8)]
+pub enum MediaQuality {
+    Balanced = 0,
+    Worse = 1,
+}
+
+impl Default for MediaQuality {
+    fn default() -> Self {
+        MediaQuality::Balanced // also change Config.MediaQuality props(default) on changes
+    }
+}
+
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+#[repr(u8)]
+pub enum KeyGenType {
+    Default = 0,
+    Rsa2048 = 1,
+    Ed25519 = 2,
+}
+
+impl Default for KeyGenType {
+    fn default() -> Self {
+        KeyGenType::Default
+    }
+}
 
 pub const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
 pub const DC_HANDSHAKE_STOP_NORMAL_PROCESSING: i32 = 0x02;
 pub const DC_HANDSHAKE_ADD_DELETE_JOB: i32 = 0x04;
 
+pub(crate) const DC_FROM_HANDSHAKE: i32 = 0x01;
+
 pub const DC_GCL_ARCHIVED_ONLY: usize = 0x01;
 pub const DC_GCL_NO_SPECIALS: usize = 0x02;
 pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
+pub const DC_GCL_FOR_FORWARDING: usize = 0x08;
 
 pub const DC_GCM_ADDDAYMARKER: u32 = 0x01;
 
@@ -60,10 +102,6 @@ pub const DC_GCL_ADD_SELF: usize = 0x02;
 
 // unchanged user avatars are resent to the recipients every some days
 pub const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
-
-// values for DC_PARAM_FORCE_PLAINTEXT
-pub(crate) const DC_FP_NO_AUTOCRYPT_HEADER: i32 = 2;
-pub(crate) const DC_FP_ADD_AUTOCRYPT_HEADER: i32 = 1;
 
 /// virtual chat showing all messages belonging to chats flagged with chats.blocked=2
 pub(crate) const DC_CHAT_ID_DEADDROP: u32 = 1;
@@ -92,6 +130,8 @@ pub const DC_CHAT_ID_LAST_SPECIAL: u32 = 9;
     FromSql,
     ToSql,
     IntoStaticStr,
+    Serialize,
+    Deserialize,
 )]
 #[repr(u32)]
 pub enum Chattype {
@@ -170,13 +210,13 @@ pub const DC_LP_SMTP_SOCKET_SSL: usize = 0x20000;
 pub const DC_LP_SMTP_SOCKET_PLAIN: usize = 0x40000;
 
 /// if none of these flags are set, the default is chosen
-pub const DC_LP_AUTH_FLAGS: i32 = (DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL);
+pub const DC_LP_AUTH_FLAGS: i32 = DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL;
 /// if none of these flags are set, the default is chosen
 pub const DC_LP_IMAP_SOCKET_FLAGS: i32 =
-    (DC_LP_IMAP_SOCKET_STARTTLS | DC_LP_IMAP_SOCKET_SSL | DC_LP_IMAP_SOCKET_PLAIN);
+    DC_LP_IMAP_SOCKET_STARTTLS | DC_LP_IMAP_SOCKET_SSL | DC_LP_IMAP_SOCKET_PLAIN;
 /// if none of these flags are set, the default is chosen
 pub const DC_LP_SMTP_SOCKET_FLAGS: usize =
-    (DC_LP_SMTP_SOCKET_STARTTLS | DC_LP_SMTP_SOCKET_SSL | DC_LP_SMTP_SOCKET_PLAIN);
+    DC_LP_SMTP_SOCKET_STARTTLS | DC_LP_SMTP_SOCKET_SSL | DC_LP_SMTP_SOCKET_PLAIN;
 
 // QR code scanning (view from Bob, the joiner)
 pub const DC_VC_AUTH_REQUIRED: i32 = 2;
@@ -187,7 +227,27 @@ pub const DC_BOB_SUCCESS: i32 = 1;
 // max. width/height of an avatar
 pub const AVATAR_SIZE: u32 = 192;
 
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql)]
+// max. width/height of images
+pub const BALANCED_IMAGE_SIZE: u32 = 1280;
+pub const WORSE_IMAGE_SIZE: u32 = 640;
+
+// this value can be increased if the folder configuration is changed and must be redone on next program start
+pub const DC_FOLDERS_CONFIGURED_VERSION: i32 = 3;
+
+#[derive(
+    Debug,
+    Display,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    FromPrimitive,
+    ToPrimitive,
+    FromSql,
+    ToSql,
+    Serialize,
+    Deserialize,
+)]
 #[repr(i32)]
 pub enum Viewtype {
     Unknown = 0,
@@ -271,8 +331,6 @@ const DC_STR_SELFNOTINGRP: usize = 21; // deprecated;
 const DC_STR_NOMESSAGES: usize = 1;
 const DC_STR_SELF: usize = 2;
 const DC_STR_DRAFT: usize = 3;
-const DC_STR_MEMBER: usize = 4;
-const DC_STR_CONTACT: usize = 6;
 const DC_STR_VOICEMESSAGE: usize = 7;
 const DC_STR_DEADDROP: usize = 8;
 const DC_STR_IMAGE: usize = 9;
@@ -304,7 +362,6 @@ const DC_STR_ARCHIVEDCHATS: usize = 40;
 const DC_STR_STARREDMSGS: usize = 41;
 const DC_STR_AC_SETUP_MSG_SUBJECT: usize = 42;
 const DC_STR_AC_SETUP_MSG_BODY: usize = 43;
-const DC_STR_SELFTALK_SUBTITLE: usize = 50;
 const DC_STR_CANNOT_LOGIN: usize = 60;
 const DC_STR_SERVER_RESPONSE: usize = 61;
 const DC_STR_MSGACTIONBYUSER: usize = 62;

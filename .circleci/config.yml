@@ -7,6 +7,10 @@ executors:
   doxygen:
     docker:
       - image: hrektts/doxygen
+  python:
+    docker:
+      - image: 3.7.7-stretch
+            
 
 restore-workspace: &restore-workspace
   attach_workspace:
@@ -120,47 +124,25 @@ jobs:
           paths:
             - c-docs
 
-  # build_test_docs_wheel:
-  #   docker:
-  #     - image: deltachat/coredeps
-  #       environment:
-  #           TESTS: 1
-  #           DOCS: 1
-  #   working_directory: /mnt/crate
-  #   steps:
-  #     - *restore-workspace
-  #     - *restore-cache
-  #     - run:
-  #         name: build docs, run tests and build wheels
-  #         command: ci_scripts/run-python.sh
-  #     - run:
-  #          name: copying docs and wheels to workspace
-  #          command: |
-  #            mkdir -p workspace/python
-  #            # cp -av docs workspace/c-docs
-  #            cp -av python/.docker-tox/wheelhouse workspace/
-  #            cp -av python/doc/_build/ workspace/py-docs
-  #     - persist_to_workspace:
-  #         root: workspace
-  #         paths:
-  #           # - c-docs
-  #           - py-docs
-  #           - wheelhouse
-
-  remote_tests_rust:
+  remote_python_packaging:
     machine: true
     steps:
       - checkout
-      - run: ci_scripts/remote_tests_rust.sh
-    
+      # the following commands on success produces
+      # workspace/{wheelhouse,py-docs} as artefact directories
+      - run: bash ci_scripts/remote_python_packaging.sh 
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            # - c-docs
+            - py-docs
+            - wheelhouse
+
   remote_tests_python:
     machine: true
     steps:
       - checkout
-      #- attach_workspace:
-      #    at: workspace
       - run: ci_scripts/remote_tests_python.sh
-    # workspace/py-docs workspace/wheelhouse workspace/c-docs
 
   upload_docs_wheels:
     machine: true
@@ -168,6 +150,7 @@ jobs:
       - checkout
       - attach_workspace:
           at: workspace
+      - run: pyenv versions
       - run: pyenv global 3.5.2
       - run: ls -laR workspace
       - run: ci_scripts/ci_upload.sh workspace/py-docs workspace/wheelhouse workspace/c-docs
@@ -189,14 +172,29 @@ workflows:
     jobs:
       # - cargo_fetch
 
-      - remote_tests_rust
+      - remote_tests_python:
+          filters:
+            tags:
+              only: /.*/
 
-      - remote_tests_python
+      - remote_python_packaging:
+          requires: 
+             - remote_tests_python
+          filters:
+            branches:
+              only: master
+            tags:
+              only: /.*/
 
-      # - upload_docs_wheels:
-      #     requires:
-      #       - build_test_docs_wheel
-      #       - build_doxygen
+      - upload_docs_wheels:
+          requires:
+             - remote_python_packaging
+             - build_doxygen
+          filters:
+            branches:
+              only: master
+            tags:
+              only: /.*/
       # - rustfmt:
       #     requires:
       #       - cargo_fetch
@@ -204,7 +202,12 @@ workflows:
       #     requires:
       #      - cargo_fetch
 
-      - build_doxygen
+      - build_doxygen:
+          filters:
+            branches:
+              only: master
+            tags:
+              only: /.*/
 
       # Linux Desktop 64bit
       # - test_x86_64-unknown-linux-gnu:
