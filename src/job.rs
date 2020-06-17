@@ -715,6 +715,12 @@ pub async fn send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<Job
     let mut msg = Message::load_from_db(context, msg_id).await?;
     msg.try_calc_and_set_dimensions(context).await.ok();
 
+    if ! context.get_config_bool(Config::E2eeEnabled).await {
+	msg.param.set_int(Param::GuaranteeE2ee, 0);
+	msg.param.set_int(Param::ForcePlaintext, 2);
+	msg.update_param(context).await;
+    }
+
     /* create message */
     let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
 

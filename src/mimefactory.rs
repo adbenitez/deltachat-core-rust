@@ -442,7 +442,8 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         unprotected_headers.push(Header::new("MIME-Version".into(), "1.0".into()));
 
-        if !self.references.is_empty() {
+        if !self.references.is_empty() && self.context.get_config_bool(Config::E2eeEnabled).await {
+
             unprotected_headers.push(Header::new("References".into(), self.references.clone()));
         }
 
@@ -468,10 +469,12 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         // This is only informational for debugging and may be removed in the release.
         // We do not rely on this header as it may be removed by MTAs.
 
-        unprotected_headers.push(Header::new(
-            "X-Mailer".into(),
-            format!("Delta Chat Core {}{}", version, os_part),
-        ));
+        if self.context.get_config_bool(Config::E2eeEnabled).await {
+            unprotected_headers.push(Header::new(
+		"X-Mailer".into(),
+		format!("Delta Chat Core {}{}", version, os_part),
+            ));
+        }
         unprotected_headers.push(Header::new("Chat-Version".to_string(), "1.0".to_string()));
 
         if let Loaded::MDN { .. } = self.loaded {
@@ -514,7 +517,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             unprotected_headers.push(Header::new("Autocrypt".into(), aheader));
         }
 
-        protected_headers.push(Header::new("Subject".into(), subject));
+        if self.context.get_config_bool(Config::E2eeEnabled).await {
+            protected_headers.push(Header::new("Subject".into(), subject));
+        }
 
         let peerstates = self.peerstates_for_recipients().await?;
         let should_encrypt =

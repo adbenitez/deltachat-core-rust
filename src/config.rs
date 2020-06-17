@@ -42,7 +42,7 @@ pub enum Config {
     #[strum(props(default = "0"))]
     BccSelf,
 
-    #[strum(props(default = "1"))]
+    #[strum(props(default = "0"))]
     E2eeEnabled,
 
     #[strum(props(default = "1"))]
@@ -51,19 +51,19 @@ pub enum Config {
     #[strum(props(default = "1"))]
     InboxWatch,
 
-    #[strum(props(default = "1"))]
+    #[strum(props(default = "0"))]
     SentboxWatch,
 
-    #[strum(props(default = "1"))]
+    #[strum(props(default = "0"))]
     MvboxWatch,
 
-    #[strum(props(default = "1"))]
+    #[strum(props(default = "0"))]
     MvboxMove,
 
-    #[strum(props(default = "0"))] // also change ShowEmails.default() on changes
+    #[strum(props(default = "2"))] // also change ShowEmails.default() on changes
     ShowEmails,
 
-    #[strum(props(default = "0"))] // also change MediaQuality.default() on changes
+    #[strum(props(default = "1"))] // also change MediaQuality.default() on changes
     MediaQuality,
 
     #[strum(props(default = "0"))]
@@ -77,7 +77,7 @@ pub enum Config {
     ///
     /// Value 1 is treated as "delete at once": messages are deleted
     /// immediately, without moving to DeltaChat folder.
-    #[strum(props(default = "0"))]
+    #[strum(props(default = "1"))]
     DeleteServerAfter,
 
     /// Timer in seconds after which the message is deleted from the
