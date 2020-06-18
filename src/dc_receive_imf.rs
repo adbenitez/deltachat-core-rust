@@ -227,6 +227,19 @@ pub async fn dc_receive_imf(
             context
                 .do_heuristics_moves(server_folder.as_ref(), insert_msg_id)
                 .await;
+            if !mime_parser.mdn_reports.is_empty() && mime_parser.has_chat_version() {
+                // This is a Delta Chat MDN. Mark as read.
+                job::add(
+                    context,
+                    job::Job::new(
+                        Action::MarkseenMsgOnImap,
+                        insert_msg_id.to_u32(),
+                        Params::new(),
+                        0,
+                    ),
+                )
+                .await;
+            }
         }
     }
 
@@ -332,7 +345,7 @@ async fn add_parts(
         return Ok(());
     }
 
-    let mut msgrmsg = if mime_parser.has_chat_version() {
+    let mut is_dc_message = if mime_parser.has_chat_version() {
         MessengerMessage::Yes
     } else if is_reply_to_messenger_message(context, mime_parser).await {
         MessengerMessage::Reply
@@ -344,7 +357,7 @@ async fn add_parts(
     let show_emails =
         ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await).unwrap_or_default();
     if mime_parser.is_system_message != SystemMessage::AutocryptSetupMessage
-        && msgrmsg == MessengerMessage::No
+        && is_dc_message == MessengerMessage::No
     {
         // this message is a classic email not a chat-message nor a reply to one
         match show_emails {
@@ -373,7 +386,7 @@ async fn add_parts(
 
         // handshake may mark contacts as verified and must be processed before chats are created
         if mime_parser.get(HeaderDef::SecureJoin).is_some() {
-            msgrmsg = MessengerMessage::Yes; // avoid discarding by show_emails setting
+            is_dc_message = MessengerMessage::Yes; // avoid discarding by show_emails setting
             *chat_id = ChatId::new(0);
             allow_creation = true;
             match handle_securejoin_handshake(context, mime_parser, from_id).await {
@@ -506,7 +519,7 @@ async fn add_parts(
         if Blocked::Not != chat_id_blocked
             && state == MessageState::InFresh
             && !incoming_origin.is_known()
-            && msgrmsg == MessengerMessage::No
+            && is_dc_message == MessengerMessage::No
             && show_emails != ShowEmails::All
         {
             state = MessageState::InNoticed;
@@ -521,7 +534,7 @@ async fn add_parts(
 
         // handshake may mark contacts as verified and must be processed before chats are created
         if mime_parser.get(HeaderDef::SecureJoin).is_some() {
-            msgrmsg = MessengerMessage::Yes; // avoid discarding by show_emails setting
+            is_dc_message = MessengerMessage::Yes; // avoid discarding by show_emails setting
             *chat_id = ChatId::new(0);
             allow_creation = true;
             match observe_securejoin_on_other_device(context, mime_parser, to_id).await {
@@ -560,7 +573,7 @@ async fn add_parts(
                 }
             }
             if chat_id.is_unset() && allow_creation {
-                let create_blocked = if MessengerMessage::No != msgrmsg
+                let create_blocked = if MessengerMessage::No != is_dc_message
                     && !Contact::is_blocked_load(context, to_id).await
                 {
                     Blocked::Not
@@ -697,7 +710,7 @@ async fn add_parts(
                     rcvd_timestamp,
                     part.typ,
                     state,
-                    msgrmsg,
+                    is_dc_message,
                     part.msg,
                     // txt_raw might contain invalid utf8
                     txt_raw,
@@ -2332,6 +2345,30 @@ mod tests {
                 .get_name(),
             "Carl"
         );
+    }
+
+    #[async_std::test]
+    async fn test_parse_ndn_tiscali() {
+        test_parse_ndn(
+            "alice@tiscali.it",
+            "shenauithz@testrun.org",
+            "Mr.un2NYERi1RM.lbQ5F9q-QyJ@tiscali.it",
+            include_bytes!("../test-data/message/tiscali_ndn.eml"),
+            "",
+        )
+        .await;
+    }
+
+    #[async_std::test]
+    async fn test_parse_ndn_testrun() {
+        test_parse_ndn(
+            "alice@testrun.org",
+            "hcksocnsofoejx@five.chat",
+            "Mr.A7pTA5IgrUA.q4bP41vAJOp@testrun.org",
+            include_bytes!("../test-data/message/testrun_ndn.eml"),
+            "Undelivered Mail Returned to Sender – This is the mail system at host hq5.merlinux.eu.\n\nI\'m sorry to have to inform you that your message could not\nbe delivered to one or more recipients. It\'s attached below.\n\nFor further assistance, please send mail to postmaster.\n\nIf you do so, please include this problem report. You can\ndelete your own text from the attached returned message.\n\n                   The mail system\n\n<hcksocnsofoejx@five.chat>: host mail.five.chat[195.62.125.103] said: 550 5.1.1\n    <hcksocnsofoejx@five.chat>: Recipient address rejected: User unknown in\n    virtual mailbox table (in reply to RCPT TO command)"
+        )
+        .await;
     }
 
     #[async_std::test]

@@ -257,7 +257,8 @@ impl MimeMessage {
                 self.parts[0].msg = "".to_string();
 
                 // swap new with old
-                std::mem::replace(&mut self.parts[0], filepart);
+                self.parts.push(filepart); // push to the end
+                let _ = self.parts.swap_remove(0); // drops first element, replacing it with the last one in O(1)
             }
         }
     }
@@ -570,13 +571,13 @@ impl MimeMessage {
 
                             any_part_added = true;
                         }
-                        Some("delivery-status") => {
+                        // Some providers, e.g. Tiscali, forget to set the report-type. So, if it's None, assume that it might be delivery-status
+                        Some("delivery-status") | None => {
                             if let Some(report) = self.process_delivery_status(context, mail)? {
                                 self.failure_report = Some(report);
                             }
 
-                            // Add all parts (in fact, AddSinglePartIfKnown() later check if
-                            // the parts are really supported)
+                            // Add all parts (we need another part, preferrably text/plain, to show as an error message)
                             for cur_data in mail.subparts.iter() {
                                 if self.parse_mime_recursive(context, cur_data).await? {
                                     any_part_added = true;
@@ -588,7 +589,6 @@ impl MimeMessage {
                                 any_part_added = self.parse_mime_recursive(context, first).await?;
                             }
                         }
-                        None => {}
                     }
                 }
             }
@@ -866,7 +866,7 @@ impl MimeMessage {
         if let Some(original_msg) = report
             .subparts
             .iter()
-            .find(|p| p.ctype.mimetype.contains("rfc822"))
+            .find(|p| p.ctype.mimetype.contains("rfc822") || p.ctype.mimetype == "message/global")
         {
             let report_body = original_msg.get_body_raw()?;
             let (report_fields, _) = mailparse::parse_headers(&report_body)?;
@@ -904,16 +904,13 @@ impl MimeMessage {
     /// If you improve heuristics here you might also have to change prefetch_should_download() in imap/mod.rs.
     /// Also you should add a test in dc_receive_imf.rs (there already are lots of test_parse_ndn_* tests).
     async fn heuristically_parse_ndn(&mut self, context: &Context) -> Option<()> {
-        if self
-            .get(HeaderDef::Subject)?
-            .to_ascii_lowercase()
-            .contains("fail")
-            && self
-                .get(HeaderDef::From_)?
-                .to_ascii_lowercase()
-                .contains("mailer-daemon")
-            && self.failure_report.is_none()
-        {
+        let maybe_ndn = if let Some(from) = self.get(HeaderDef::From_) {
+            let from = from.to_ascii_lowercase();
+            from.contains("mailer-daemon") || from.contains("mail-daemon")
+        } else {
+            false
+        };
+        if maybe_ndn && self.failure_report.is_none() {
             lazy_static! {
                 static ref RE: regex::Regex = regex::Regex::new(r"Message-ID:(.*)").unwrap();
             }
