@@ -1,5 +1,7 @@
 //! Contacts module
 
+#![forbid(clippy::indexing_slicing)]
+
 use async_std::path::PathBuf;
 use deltachat_derive::*;
 use itertools::Itertools;
@@ -1029,10 +1031,10 @@ pub fn addr_normalize(addr: &str) -> &str {
     let norm = addr.trim();
 
     if norm.starts_with("mailto:") {
-        return &norm[7..];
+        norm.get(7..).unwrap_or(norm)
+    } else {
+        norm
     }
-
-    norm
 }
 
 fn sanitize_name_and_addr(name: impl AsRef<str>, addr: impl AsRef<str>) -> (String, String) {
@@ -1042,11 +1044,15 @@ fn sanitize_name_and_addr(name: impl AsRef<str>, addr: impl AsRef<str>) -> (Stri
     if let Some(captures) = ADDR_WITH_NAME_REGEX.captures(addr.as_ref()) {
         (
             if name.as_ref().is_empty() {
-                normalize_name(&captures[1])
+                captures
+                    .get(1)
+                    .map_or("".to_string(), |m| normalize_name(m.as_str()))
             } else {
                 name.as_ref().to_string()
             },
-            captures[2].to_string(),
+            captures
+                .get(2)
+                .map_or("".to_string(), |m| m.as_str().to_string()),
         )
     } else {
         (name.as_ref().to_string(), addr.as_ref().to_string())
@@ -1113,38 +1119,21 @@ pub(crate) async fn set_profile_image(
 /// Normalize a name.
 ///
 /// - Remove quotes (come from some bad MUA implementations)
-/// - Convert names as "Petersen, Björn" to "Björn Petersen"
 /// - Trims the resulting string
 ///
 /// Typically, this function is not needed as it is called implicitly by `Contact::add_address_book`.
 pub fn normalize_name(full_name: impl AsRef<str>) -> String {
-    let mut full_name = full_name.as_ref().trim();
+    let full_name = full_name.as_ref().trim();
     if full_name.is_empty() {
         return full_name.into();
     }
 
-    let len = full_name.len();
-    if len > 1 {
-        let firstchar = full_name.as_bytes()[0];
-        let lastchar = full_name.as_bytes()[len - 1];
-        if firstchar == b'\'' && lastchar == b'\''
-            || firstchar == b'\"' && lastchar == b'\"'
-            || firstchar == b'<' && lastchar == b'>'
-        {
-            full_name = &full_name[1..len - 1];
-        }
+    match full_name.as_bytes() {
+        [b'\'', .., b'\''] | [b'\"', .., b'\"'] | [b'<', .., b'>'] => full_name
+            .get(1..full_name.len() - 1)
+            .map_or("".to_string(), |s| s.trim().into()),
+        _ => full_name.to_string(),
     }
-
-    if let Some(p1) = full_name.find(',') {
-        let (last_name, first_name) = full_name.split_at(p1);
-
-        let last_name = last_name.trim();
-        let first_name = (&first_name[1..]).trim();
-
-        return format!("{} {}", first_name, last_name);
-    }
-
-    full_name.trim().into()
 }
 
 fn cat_fingerprint(
@@ -1235,7 +1224,6 @@ mod tests {
 
     #[test]
     fn test_normalize_name() {
-        assert_eq!(&normalize_name("Doe, John"), "John Doe");
         assert_eq!(&normalize_name(" hello world   "), "hello world");
         assert_eq!(&normalize_name("<"), "<");
         assert_eq!(&normalize_name(">"), ">");
@@ -1400,10 +1388,10 @@ mod tests {
         assert!(contact_id > DC_CONTACT_ID_LAST_SPECIAL);
         assert_eq!(sth_modified, Modifier::None);
         let contact = Contact::load_from_db(&t.ctx, contact_id).await.unwrap();
-        assert_eq!(contact.get_name(), "Alice Wonderland");
-        assert_eq!(contact.get_display_name(), "Alice Wonderland");
+        assert_eq!(contact.get_name(), "Wonderland, Alice");
+        assert_eq!(contact.get_display_name(), "Wonderland, Alice");
         assert_eq!(contact.get_addr(), "alice@w.de");
-        assert_eq!(contact.get_name_n_addr(), "Alice Wonderland (alice@w.de)");
+        assert_eq!(contact.get_name_n_addr(), "Wonderland, Alice (alice@w.de)");
 
         // check SELF
         let contact = Contact::load_from_db(&t.ctx, DC_CONTACT_ID_SELF)
@@ -1587,7 +1575,7 @@ mod tests {
             .await
             .unwrap();
         let contact = Contact::load_from_db(&t.ctx, contact_id).await.unwrap();
-        assert_eq!(contact.get_name(), "Dave Mueller");
+        assert_eq!(contact.get_name(), "Mueller, Dave");
         assert_eq!(contact.get_addr(), "dave@example.org");
 
         let contact_id = Contact::create(&t.ctx, "name1", "name2 <dave@example.org>")
