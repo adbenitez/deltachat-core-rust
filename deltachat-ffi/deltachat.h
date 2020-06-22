@@ -268,11 +268,14 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `mdns_enabled` = 0=do not send or request read receipts,
  *                    1=send and request read receipts (default)
  * - `inbox_watch`  = 1=watch `INBOX`-folder for changes (default),
- *                    0=do not watch the `INBOX`-folder
+ *                    0=do not watch the `INBOX`-folder,
+ *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `sentbox_watch`= 1=watch `Sent`-folder for changes (default),
- *                    0=do not watch the `Sent`-folder
+ *                    0=do not watch the `Sent`-folder,
+ *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `mvbox_watch`  = 1=watch `DeltaChat`-folder for changes (default),
- *                    0=do not watch the `DeltaChat`-folder
+ *                    0=do not watch the `DeltaChat`-folder,
+ *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `mvbox_move`   = 1=heuristically detect chat-messages
  *                    and move them to the `DeltaChat`-folder,
  *                    0=do not move chat-messages
@@ -4307,7 +4310,7 @@ void dc_event_unref(dc_event_t* event);
  */
 
 /**
- * Prover works out-of-the-box.
+ * Provider works out-of-the-box.
  * This provider status is returned for provider where the login
  * works by just entering the name or the email-address.
  *
