@@ -830,14 +830,11 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
     };
 
     block_on(async move {
-        let arr = dc_array_t::from(
+        Box::into_raw(Box::new(
             chat::get_chat_msgs(&ctx, ChatId::new(chat_id), flags, marker_flag)
                 .await
-                .iter()
-                .map(|msg_id| msg_id.to_u32())
-                .collect::<Vec<u32>>(),
-        );
-        Box::into_raw(Box::new(arr))
+                .into(),
+        ))
     })
 }
 
@@ -966,7 +963,7 @@ pub unsafe extern "C" fn dc_get_chat_media(
         from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {}", or_msg_type3));
 
     block_on(async move {
-        let arr = dc_array_t::from(
+        Box::into_raw(Box::new(
             chat::get_chat_media(
                 &ctx,
                 ChatId::new(chat_id),
@@ -975,11 +972,8 @@ pub unsafe extern "C" fn dc_get_chat_media(
                 or_msg_type3,
             )
             .await
-            .iter()
-            .map(|msg_id| msg_id.to_u32())
-            .collect::<Vec<u32>>(),
-        );
-        Box::into_raw(Box::new(arr))
+            .into(),
+        ))
     })
 }
 
@@ -2053,16 +2047,6 @@ pub unsafe extern "C" fn dc_array_search_id(
     } else {
         0
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_array_get_raw(array: *const dc_array_t) -> *const u32 {
-    if array.is_null() {
-        eprintln!("ignoring careless call to dc_array_get_raw()");
-        return ptr::null_mut();
-    }
-
-    (*array).as_ptr()
 }
 
 // Return the independent-state of the location at the given index.
