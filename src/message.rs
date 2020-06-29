@@ -68,20 +68,6 @@ impl MsgId {
         self.0 == 0
     }
 
-    /// Whether the message ID is the special marker1 marker.
-    ///
-    /// See the docs of the `dc_get_chat_msgs` C API for details.
-    pub fn is_marker1(self) -> bool {
-        self.0 == DC_MSG_ID_MARKER1
-    }
-
-    /// Whether the message ID is the special day marker.
-    ///
-    /// See the docs of the `dc_get_chat_msgs` C API for details.
-    pub fn is_daymarker(self) -> bool {
-        self.0 == DC_MSG_ID_DAYMARKER
-    }
-
     /// Put message into trash chat and delete message text.
     ///
     /// It means the message is deleted locally, but not on the server
@@ -143,16 +129,7 @@ impl MsgId {
 
 impl std::fmt::Display for MsgId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Would be nice if we could use match here, but no computed values in ranges.
-        if self.0 == DC_MSG_ID_MARKER1 {
-            write!(f, "Msg#Marker1")
-        } else if self.0 == DC_MSG_ID_DAYMARKER {
-            write!(f, "Msg#DayMarker")
-        } else if self.0 <= DC_MSG_ID_LAST_SPECIAL {
-            write!(f, "Msg#UnknownSpecial")
-        } else {
-            write!(f, "Msg#{}", self.0)
-        }
+        write!(f, "Msg#{}", self.0)
     }
 }
 
@@ -246,6 +223,8 @@ pub struct Message {
     pub(crate) timestamp_sort: i64,
     pub(crate) timestamp_sent: i64,
     pub(crate) timestamp_rcvd: i64,
+    pub(crate) ephemeral_timer: i64,
+    pub(crate) ephemeral_timestamp: i64,
     pub(crate) text: Option<String>,
     pub(crate) rfc724_mid: String,
     pub(crate) in_reply_to: Option<String>,
@@ -288,6 +267,8 @@ impl Message {
                     "    m.timestamp AS timestamp,",
                     "    m.timestamp_sent AS timestamp_sent,",
                     "    m.timestamp_rcvd AS timestamp_rcvd,",
+                    "    m.ephemeral_timer AS ephemeral_timer,",
+                    "    m.ephemeral_timestamp AS ephemeral_timestamp,",
                     "    m.type AS type,",
                     "    m.state AS state,",
                     "    m.error AS error,",
@@ -316,6 +297,8 @@ impl Message {
                     msg.timestamp_sort = row.get("timestamp")?;
                     msg.timestamp_sent = row.get("timestamp_sent")?;
                     msg.timestamp_rcvd = row.get("timestamp_rcvd")?;
+                    msg.ephemeral_timer = row.get("ephemeral_timer")?;
+                    msg.ephemeral_timestamp = row.get("ephemeral_timestamp")?;
                     msg.viewtype = row.get("type")?;
                     msg.state = row.get("state")?;
                     msg.error = row.get("error")?;
@@ -891,6 +874,17 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> String {
         ret += "\n";
     }
 
+    if msg.ephemeral_timer != 0 {
+        ret += &format!("Ephemeral timer: {}\n", msg.ephemeral_timer);
+    }
+
+    if msg.ephemeral_timestamp != 0 {
+        ret += &format!(
+            "Expires: {}\n",
+            dc_timestamp_to_str(msg.ephemeral_timestamp)
+        );
+    }
+
     if msg.from_id == DC_CONTACT_ID_INFO || msg.to_id == DC_CONTACT_ID_INFO {
         // device-internal message, no further details needed
         return ret;
@@ -1096,6 +1090,14 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> bool {
     let mut send_event = false;
 
     for (id, curr_state, curr_blocked) in msgs.into_iter() {
+        if let Err(err) = id.start_ephemeral_timer(context).await {
+            error!(
+                context,
+                "Failed to start ephemeral timer for message {}: {}", id, err
+            );
+            continue;
+        }
+
         if curr_blocked == Blocked::Not {
             if curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed {
                 update_msg_state(context, id, MessageState::InSeen).await;
