@@ -19,10 +19,34 @@ impl dc_array_t {
             Self::Chat(array) => match array[index] {
                 ChatItem::Message { msg_id } => msg_id.to_u32(),
                 ChatItem::Marker1 => DC_MSG_ID_MARKER1,
-                ChatItem::DayMarker => DC_MSG_ID_DAYMARKER,
+                ChatItem::DayMarker { .. } => DC_MSG_ID_DAYMARKER,
             },
             Self::Locations(array) => array[index].location_id,
             Self::Uint(array) => array[index],
+        }
+    }
+
+    pub(crate) fn get_timestamp(&self, index: usize) -> Option<i64> {
+        match self {
+            Self::MsgIds(_) => None,
+            Self::Chat(array) => array.get(index).and_then(|item| match item {
+                ChatItem::Message { .. } => None,
+                ChatItem::Marker1 { .. } => None,
+                ChatItem::DayMarker { timestamp } => Some(*timestamp),
+            }),
+            Self::Locations(array) => array.get(index).map(|location| location.timestamp),
+            Self::Uint(_) => None,
+        }
+    }
+
+    pub(crate) fn get_marker(&self, index: usize) -> Option<&str> {
+        match self {
+            Self::MsgIds(_) => None,
+            Self::Chat(array) => None,
+            Self::Locations(array) => array
+                .get(index)
+                .and_then(|location| location.marker.as_deref()),
+            Self::Uint(_) => None,
         }
     }
 
