@@ -1138,8 +1138,8 @@ async fn create_or_lookup_group(
             // otherwise, a pending "quit" message may pop up
             && removed_id == 0
             // re-create explicitly left groups only if ourself is re-added
-            && (!group_explicitly_left
-                || X_MrAddToGrp.is_some() && addr_cmp(&self_addr, X_MrAddToGrp.as_ref().unwrap()))
+            // && (!group_explicitly_left
+            //     || X_MrAddToGrp.is_some() && addr_cmp(&self_addr, X_MrAddToGrp.as_ref().unwrap()))
     {
         // group does not exist but should be created
         let create_verified = if mime_parser.get(HeaderDef::ChatVerified).is_some() {
