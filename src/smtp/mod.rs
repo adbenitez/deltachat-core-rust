@@ -18,7 +18,7 @@ use crate::provider::get_provider_info;
 use crate::stock::StockMessage;
 
 /// SMTP write and read timeout in seconds.
-const SMTP_TIMEOUT: u64 = 30;
+const SMTP_TIMEOUT: u64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
