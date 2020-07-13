@@ -74,6 +74,13 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
                 }
                 None => {
                     jobs_loaded = 0;
+
+                    // Expunge folder if needed, e.g. if some jobs have
+                    // deleted messages on the server.
+                    if let Err(err) = connection.maybe_close_folder(&ctx).await {
+                        warn!(ctx, "failed to close folder: {:?}", err);
+                    }
+
                     info = if ctx.get_config_bool(Config::InboxWatch).await {
                         fetch_idle(&ctx, &mut connection, Config::ConfiguredInboxFolder).await
                     } else {
@@ -120,7 +127,7 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
         Some(watch_folder) => {
             // connect and fake idle if unable to connect
             if let Err(err) = connection.connect_configured(&ctx).await {
-                error!(ctx, "imap connection failed: {}", err);
+                warn!(ctx, "imap connection failed: {}", err);
                 return connection.fake_idle(&ctx, None).await;
             }
 
