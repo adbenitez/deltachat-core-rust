@@ -1143,7 +1143,7 @@ async fn create_or_lookup_group(
         .unwrap_or_default();
 
     if chat_id.is_unset()
-            && !mime_parser.is_mailinglist_message()
+            // && !mime_parser.is_mailinglist_message()
             && !grpid.is_empty()
             && grpname.is_some()
             // otherwise, a pending "quit" message may pop up
@@ -1315,15 +1315,15 @@ async fn create_or_lookup_adhoc_group(
     from_id: u32,
     to_ids: &ContactIds,
 ) -> Result<(ChatId, Blocked)> {
-    if mime_parser.is_mailinglist_message() {
-        // XXX we could parse List-* headers and actually create and
-        // manage a mailing list group, eventually
-        info!(
-            context,
-            "not creating ad-hoc group for mailing list message"
-        );
-        return Ok((ChatId::new(0), Blocked::Not));
-    }
+    // if mime_parser.is_mailinglist_message() {
+    //     // XXX we could parse List-* headers and actually create and
+    //     // manage a mailing list group, eventually
+    //     info!(
+    //         context,
+    //         "not creating ad-hoc group for mailing list message"
+    //     );
+    //     return Ok((ChatId::new(0), Blocked::Not));
+    // }
 
     // if we're here, no grpid was found, check if there is an existing
     // ad-hoc group matching the to-list or if we should and can create one
