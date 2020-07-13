@@ -465,13 +465,13 @@ async fn add_parts(
             }
         }
 
-        if chat_id.is_unset() {
-            // check if the message belongs to a mailing list
-            if mime_parser.is_mailinglist_message() {
-                *chat_id = ChatId::new(DC_CHAT_ID_TRASH);
-                info!(context, "Message belongs to a mailing list and is ignored.",);
-            }
-        }
+        // if chat_id.is_unset() {
+        //     // check if the message belongs to a mailing list
+        //     if mime_parser.is_mailinglist_message() {
+        //         *chat_id = ChatId::new(DC_CHAT_ID_TRASH);
+        //         info!(context, "Message belongs to a mailing list and is ignored.",);
+        //     }
+        // }
 
         if chat_id.is_unset() {
             // try to create a normal chat
