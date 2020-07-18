@@ -122,6 +122,13 @@ pub enum Config {
     /// Whether we send a warning if the password is wrong (set to false when we send a warning
     /// because we do not want to send a second warning)
     NotifyAboutWrongPw,
+
+    /// address to webrtc signaling server (https://github.com/cracker0dks/basicwebrtc)
+    /// that should be used for opening video hangouts.
+    /// This property is only used in the UIs not by the core itself.
+    /// Format: https://example.com/subdir
+    /// The other properties that are needed for a call such as the roomname will be set by the client in the anchor part of the url.
+    BasicWebRTCInstance,
 }
 
 impl Context {
