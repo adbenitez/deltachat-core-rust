@@ -11,8 +11,17 @@ from datetime import datetime, timedelta
 
 
 @pytest.mark.parametrize("msgtext,res", [
-    ("Member Me (tmp1@x.org) removed by tmp2@x.org.", ("removed", "tmp1@x.org")),
-    ("Member tmp1@x.org added by tmp2@x.org.", ("added", "tmp1@x.org")),
+    ("Member Me (tmp1@x.org) removed by tmp2@x.org.",
+        ("removed", "tmp1@x.org", "tmp2@x.org")),
+    ("Member With space (tmp1@x.org) removed by tmp2@x.org.",
+        ("removed", "tmp1@x.org", "tmp2@x.org")),
+    ("Member With space (tmp1@x.org) removed by Another member (tmp2@x.org).",
+        ("removed", "tmp1@x.org", "tmp2@x.org")),
+    ("Member With space (tmp1@x.org) removed by me",
+        ("removed", "tmp1@x.org", "me")),
+    ("Member tmp1@x.org added by tmp2@x.org.", ("added", "tmp1@x.org", "tmp2@x.org")),
+    ("Member nothing bla bla", None),
+    ("Another unknown system message", None),
 ])
 def test_parse_system_add_remove(msgtext, res):
     from deltachat.message import parse_system_add_remove
@@ -452,12 +461,12 @@ class TestOfflineChat:
 
         class InPlugin:
             @account_hookimpl
-            def ac_member_added(self, chat, contact):
-                in_list.append(("added", chat, contact))
+            def ac_member_added(self, chat, contact, actor):
+                in_list.append(("added", chat, contact, actor))
 
             @account_hookimpl
-            def ac_member_removed(self, chat, contact):
-                in_list.append(("removed", chat, contact))
+            def ac_member_removed(self, chat, contact, actor):
+                in_list.append(("removed", chat, contact, actor))
 
         ac1.add_account_plugin(InPlugin())
 
@@ -486,10 +495,11 @@ class TestOfflineChat:
 
         assert len(in_list) == 10
         chat_contacts = chat.get_contacts()
-        for in_cmd, in_chat, in_contact in in_list:
+        for in_cmd, in_chat, in_contact, in_actor in in_list:
             assert in_cmd == "added"
             assert in_chat == chat
             assert in_contact in chat_contacts
+            assert in_actor is None
             chat_contacts.remove(in_contact)
 
         assert chat_contacts[0].id == 1  # self contact
@@ -1551,21 +1561,23 @@ class TestOnlineAccount:
 
         acfactory.wait_configure_and_start_io()
 
-        imap = ac2.direct_imap
-        imap.idle_start()
+        imap2 = ac2.direct_imap
+        imap2.idle_start()
 
         lp.sec("ac1: create chat with ac2")
         chat1 = ac1.create_chat(ac2)
         ac2.create_chat(ac1)
 
         sent_msg = chat1.send_text("hello")
-        imap.idle_check(terminate=False)
+        imap2.idle_check(terminate=False)
 
         msg = ac2._evtracker.wait_next_incoming_message()
         assert msg.text == "hello"
 
-        imap.idle_check(terminate=True)
-        assert len(imap.get_all_messages()) == 0
+        imap2.idle_check(terminate=True)
+        ac2._evtracker.get_info_contains("close/expunge succeeded")
+
+        assert len(imap2.get_all_messages()) == 0
 
         # Mark deleted message as seen and check that read receipt arrives
         msg.mark_seen()
@@ -1622,6 +1634,7 @@ class TestOnlineAccount:
 
         lp.sec("ac2: set ephemeral timer to 0")
         chat2.set_ephemeral_timer(0)
+        ac2._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")
 
         lp.sec("ac1: receive system message about ephemeral timer modification")
         ac1._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")

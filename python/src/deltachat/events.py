@@ -86,11 +86,11 @@ class FFIEventTracker:
             if rex.match(ev.name):
                 return ev
 
-    def get_info_matching(self, regex):
-        rex = re.compile("(?:{}).*".format(regex))
+    def get_info_contains(self, regex):
+        rex = re.compile(regex)
         while 1:
             ev = self.get_matching("DC_EVENT_INFO")
-            if rex.match(ev.data2):
+            if rex.search(ev.data2):
                 return ev
 
     def ensure_event_not_queued(self, event_name_regex):
@@ -139,6 +139,7 @@ class EventThread(threading.Thread):
         self.account = account
         super(EventThread, self).__init__(name="events")
         self.setDaemon(True)
+        self._marked_for_shutdown = False
         self.start()
 
     @contextmanager
@@ -147,12 +148,15 @@ class EventThread(threading.Thread):
         yield
         self.account.log(message + " FINISHED")
 
-    def wait(self):
+    def mark_shutdown(self):
+        self._marked_for_shutdown = True
+
+    def wait(self, timeout=None):
         if self == threading.current_thread():
             # we are in the callback thread and thus cannot
             # wait for the thread-loop to finish.
             return
-        self.join()
+        self.join(timeout=timeout)
 
     def run(self):
         """ get and run events until shutdown. """
@@ -164,9 +168,11 @@ class EventThread(threading.Thread):
             lib.dc_get_event_emitter(self.account._dc_context),
             lib.dc_event_emitter_unref,
         )
-        while 1:
+        while not self._marked_for_shutdown:
             event = lib.dc_get_next_event(event_emitter)
             if event == ffi.NULL:
+                break
+            if self._marked_for_shutdown:
                 break
             evt = lib.dc_event_get_id(event)
             data1 = lib.dc_event_get_data1_int(event)
