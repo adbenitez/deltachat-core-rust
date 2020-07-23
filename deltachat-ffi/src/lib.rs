@@ -1,3 +1,4 @@
+#![deny(clippy::all)]
 #![allow(
     non_camel_case_types,
     non_snake_case,
@@ -486,7 +487,7 @@ pub unsafe extern "C" fn dc_get_next_event(events: *mut dc_event_emitter_t) -> *
     events
         .recv_sync()
         .map(|ev| Box::into_raw(Box::new(ev)))
-        .unwrap_or_else(|| ptr::null_mut())
+        .unwrap_or_else(ptr::null_mut)
 }
 
 #[no_mangle]

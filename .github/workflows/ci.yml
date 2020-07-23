@@ -38,15 +38,28 @@ jobs:
       - uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all
 
 
   build_and_test:
     name: Build and test
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        rust: [nightly, 1.45.0]
+        rust: [1.45.0]
+        experimental: [false]
+        include:
+          - os: ubuntu-latest
+            rust: nightly
+            experimental: true
+          - os: windows-latest
+            rust: nightly
+            experimental: true
+          - os: macOS-latest
+            rust: nightly
+            experimental: true
 
     steps:
     - uses: actions/checkout@master
@@ -79,11 +92,10 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command:  check
-        args: --workspace --all --bins --examples --tests
+        args: --all --bins --examples --tests
 
     - name: tests
       uses: actions-rs/cargo@v1
       with:
         command: test
-        args: --workspace
-          
+        args: --all
