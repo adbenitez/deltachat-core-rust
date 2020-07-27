@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{self, Chat, ChatId};
+use crate::config::Config;
 use crate::constants::*;
 use crate::contact::*;
 use crate::context::*;
@@ -66,6 +67,40 @@ impl MsgId {
     /// `true`.
     pub fn is_unset(self) -> bool {
         self.0 == 0
+    }
+
+    /// Returns message state.
+    pub async fn get_state(self, context: &Context) -> crate::sql::Result<MessageState> {
+        let result = context
+            .sql
+            .query_get_value_result("SELECT state FROM msgs WHERE id=?", paramsv![self])
+            .await?
+            .unwrap_or_default();
+        Ok(result)
+    }
+
+    /// Returns true if the message needs to be moved from `folder`.
+    pub async fn needs_move(self, context: &Context, folder: &str) -> Result<bool, Error> {
+        if !context.get_config_bool(Config::MvboxMove).await {
+            return Ok(false);
+        }
+
+        if context.is_mvbox(folder).await {
+            return Ok(false);
+        }
+
+        let msg = Message::load_from_db(context, self).await?;
+
+        if msg.is_setupmessage() {
+            // do not move setup messages;
+            // there may be a non-delta device that wants to handle it
+            return Ok(false);
+        }
+
+        match msg.is_dc_message {
+            MessengerMessage::No => Ok(false),
+            MessengerMessage::Yes | MessengerMessage::Reply => Ok(true),
+        }
     }
 
     /// Put message into trash chat and delete message text.
@@ -600,6 +635,39 @@ impl Message {
             }
         }
 
+        None
+    }
+
+    /// split a webrtc_instance as defined by the corresponding config-value into a type and a url
+    pub fn parse_webrtc_instance(instance: &str) -> (VideochatType, String) {
+        let mut split = instance.splitn(2, ':');
+        let type_str = split.next().unwrap_or_default().to_lowercase();
+        let url = split.next();
+        if type_str == "basicwebrtc" {
+            (
+                VideochatType::BasicWebrtc,
+                url.unwrap_or_default().to_string(),
+            )
+        } else {
+            (VideochatType::Unknown, instance.to_string())
+        }
+    }
+
+    pub fn get_videochat_url(&self) -> Option<String> {
+        if self.viewtype == Viewtype::VideochatInvitation {
+            if let Some(instance) = self.param.get(Param::WebrtcRoom) {
+                return Some(Message::parse_webrtc_instance(instance).1);
+            }
+        }
+        None
+    }
+
+    pub fn get_videochat_type(&self) -> Option<VideochatType> {
+        if self.viewtype == Viewtype::VideochatInvitation {
+            if let Some(instance) = self.param.get(Param::WebrtcRoom) {
+                return Some(Message::parse_webrtc_instance(instance).0);
+            }
+        }
         None
     }
 
@@ -1206,6 +1274,13 @@ pub async fn get_summarytext_by_raw(
                 format!("{} – {}", label, file_name)
             }
         }
+        Viewtype::VideochatInvitation => {
+            append_text = false;
+            context
+                .stock_str(StockMessage::VideochatInvitation)
+                .await
+                .into_owned()
+        }
         _ => {
             if param.get_cmd() != SystemMessage::LocationOnly {
                 "".to_string()
@@ -1763,5 +1838,20 @@ mod tests {
             get_summarytext_by_raw(Viewtype::File, no_text.as_ref(), &mut asm_file, 50, &ctx).await,
             "Autocrypt Setup Message" // file name is not added for autocrypt setup messages
         );
+    }
+
+    #[async_std::test]
+    async fn test_parse_webrtc_instance() {
+        let (webrtc_type, url) = Message::parse_webrtc_instance("basicwebrtc:https://foo/bar");
+        assert_eq!(webrtc_type, VideochatType::BasicWebrtc);
+        assert_eq!(url, "https://foo/bar");
+
+        let (webrtc_type, url) = Message::parse_webrtc_instance("bAsIcwEbrTc:url");
+        assert_eq!(webrtc_type, VideochatType::BasicWebrtc);
+        assert_eq!(url, "url");
+
+        let (webrtc_type, url) = Message::parse_webrtc_instance("https://foo/bar?key=val#key=val");
+        assert_eq!(webrtc_type, VideochatType::Unknown);
+        assert_eq!(url, "https://foo/bar?key=val#key=val");
     }
 }

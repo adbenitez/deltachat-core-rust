@@ -800,6 +800,20 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                     "ephemeral-timer-changed".to_string(),
                 ));
             }
+            SystemMessage::LocationOnly => {
+                // This should prevent automatic replies,
+                // such as non-delivery reports.
+                //
+                // See https://tools.ietf.org/html/rfc3834
+                //
+                // Adding this header without encryption leaks some
+                // information about the message contents, but it can
+                // already be easily guessed from message timing and size.
+                unprotected_headers.push(Header::new(
+                    "Auto-Submitted".to_string(),
+                    "auto-generated".to_string(),
+                ));
+            }
             SystemMessage::AutocryptSetupMessage => {
                 unprotected_headers
                     .push(Header::new("Autocrypt-Setup-Message".into(), "v1".into()));
@@ -861,6 +875,19 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         if self.msg.viewtype == Viewtype::Sticker {
             protected_headers.push(Header::new("Chat-Content".into(), "sticker".into()));
+        } else if self.msg.viewtype == Viewtype::VideochatInvitation {
+            protected_headers.push(Header::new(
+                "Chat-Content".into(),
+                "videochat-invitation".into(),
+            ));
+            protected_headers.push(Header::new(
+                "Chat-Webrtc-Room".into(),
+                self.msg
+                    .param
+                    .get(Param::WebrtcRoom)
+                    .unwrap_or_default()
+                    .into(),
+            ));
         }
 
         if self.msg.viewtype == Viewtype::Voice
@@ -1403,6 +1430,54 @@ mod tests {
                 .as_bytes(),
         )
         .await;
+
+        // 5. Receive an mdn (read receipt) and make sure the mdn's subject is not used
+        let t = TestContext::new_alice().await;
+        dc_receive_imf(
+            &t.ctx,
+            b"From: alice@example.com\n\
+            To: Charlie <charlie@example.com>\n\
+            Subject: Hello, Charlie\n\
+            Chat-Version: 1.0\n\
+            Message-ID: <2893@example.com>\n\
+            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
+            \n\
+            hello\n",
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let new_msg = incoming_msg_to_reply_msg(b"From: charlie@example.com\n\
+                 To: alice@example.com\n\
+                 Subject: message opened\n\
+                 Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
+                 Chat-Version: 1.0\n\
+                 Message-ID: <Mr.12345678902@example.com>\n\
+                 Content-Type: multipart/report; report-type=disposition-notification; boundary=\"SNIPP\"\n\
+                 \n\
+                 \n\
+                 --SNIPP\n\
+                 Content-Type: text/plain; charset=utf-8\n\
+                 \n\
+                 Read receipts do not guarantee sth. was read.\n\
+                 \n\
+                 \n\
+                 --SNIPP\n\
+                 Content-Type: message/disposition-notification\n\
+                 \n\
+                 Reporting-UA: Delta Chat 1.28.0\n\
+                 Original-Recipient: rfc822;charlie@example.com\n\
+                 Final-Recipient: rfc822;charlie@example.com\n\
+                 Original-Message-ID: <2893@example.com>\n\
+                 Disposition: manual-action/MDN-sent-automatically; displayed\n\
+                 \n", &t.ctx).await;
+        let mf = MimeFactory::from_msg(&t.ctx, &new_msg, false)
+            .await
+            .unwrap();
+        // The subject string should not be "Re: message opened"
+        assert_eq!("Re: Hello, Charlie", mf.subject_str().await);
     }
 
     async fn first_subject_str(t: TestContext) -> String {
@@ -1439,7 +1514,7 @@ mod tests {
         mf.subject_str().await
     }
 
-    // Creates a mimefactory for a message that replies "Hi" to the incoming message in `imf_raw`.
+    // Creates a `Message` that replies "Hi" to the incoming email in `imf_raw`.
     async fn incoming_msg_to_reply_msg(imf_raw: &[u8], context: &Context) -> Message {
         context
             .set_config(Config::ShowEmails, Some("2"))

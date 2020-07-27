@@ -197,7 +197,14 @@ pub async fn dc_receive_imf(
     }
 
     if let Some(avatar_action) = &mime_parser.user_avatar {
-        match contact::set_profile_image(&context, from_id, avatar_action).await {
+        match contact::set_profile_image(
+            &context,
+            from_id,
+            avatar_action,
+            mime_parser.was_encrypted(),
+        )
+        .await
+        {
             Ok(()) => {
                 context.emit_event(Event::ChatModified(chat_id));
             }
@@ -224,24 +231,29 @@ pub async fn dc_receive_imf(
                 )
                 .await;
             }
-        } else {
+        } else if insert_msg_id
+            .needs_move(context, server_folder.as_ref())
+            .await
+            .unwrap_or_default()
+        {
             // Move message if we don't delete it immediately.
-            context
-                .do_heuristics_moves(server_folder.as_ref(), insert_msg_id)
-                .await;
-            if !mime_parser.mdn_reports.is_empty() && mime_parser.has_chat_version() {
-                // This is a Delta Chat MDN. Mark as read.
-                job::add(
-                    context,
-                    job::Job::new(
-                        Action::MarkseenMsgOnImap,
-                        insert_msg_id.to_u32(),
-                        Params::new(),
-                        0,
-                    ),
-                )
-                .await;
-            }
+            job::add(
+                context,
+                job::Job::new(Action::MoveMsg, insert_msg_id.to_u32(), Params::new(), 0),
+            )
+            .await;
+        } else if !mime_parser.mdn_reports.is_empty() && mime_parser.has_chat_version() {
+            // This is a Delta Chat MDN. Mark as read.
+            job::add(
+                context,
+                job::Job::new(
+                    Action::MarkseenMsgOnImap,
+                    insert_msg_id.to_u32(),
+                    Params::new(),
+                    0,
+                ),
+            )
+            .await;
         }
     }
 
@@ -855,15 +867,17 @@ async fn add_parts(
         chat.update_param(context).await?;
         Ok(())
     }
-    update_last_subject(context, chat_id, mime_parser)
-        .await
-        .unwrap_or_else(|e| {
-            warn!(
-                context,
-                "Could not update LastSubject of chat: {}",
-                e.to_string()
-            )
-        });
+    if !is_mdn {
+        update_last_subject(context, chat_id, mime_parser)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    context,
+                    "Could not update LastSubject of chat: {}",
+                    e.to_string()
+                )
+            });
+    }
 
     Ok(())
 }
@@ -1185,23 +1199,19 @@ async fn create_or_lookup_group(
 
     // again, check chat_id
     if chat_id.is_special() {
-        return if group_explicitly_left {
-            Ok((ChatId::new(DC_CHAT_ID_TRASH), chat_id_blocked))
+        if mime_parser.decrypting_failed {
+            // It is possible that the message was sent to a valid,
+            // yet unknown group, which was rejected because
+            // Chat-Group-Name, which is in the encrypted part, was
+            // not found. We can't create a properly named group in
+            // this case, so assign error message to 1:1 chat with the
+            // sender instead.
+            return Ok((ChatId::new(0), Blocked::Not));
         } else {
-            create_or_lookup_adhoc_group(
-                context,
-                mime_parser,
-                allow_creation,
-                create_blocked,
-                from_id,
-                to_ids,
-            )
-            .await
-            .map_err(|err| {
-                warn!(context, "failed to create ad-hoc group: {:?}", err);
-                err
-            })
-        };
+            // The message was decrypted successfully, but contains a late "quit" or otherwise
+            // unwanted message.
+            return Ok((ChatId::new(DC_CHAT_ID_TRASH), chat_id_blocked));
+        }
     }
 
     // We have a valid chat_id > DC_CHAT_ID_LAST_SPECIAL.
@@ -1386,12 +1396,10 @@ async fn create_or_lookup_adhoc_group(
         // decrypted.
         //
         // The subject may be encrypted and contain a placeholder such
-        // as "...". Besides that, it is possible that the message was
-        // sent to a valid, yet unknown group, which was rejected
-        // because Chat-Group-Name, which is in the encrypted part,
-        // was not found. Generating a new ID in this case would
-        // result in creation of a twin group with a different group
-        // ID.
+        // as "...". It can also be a COI group, with encrypted
+        // Chat-Group-ID and incompatible Message-ID format.
+        //
+        // Instead, assign the message to 1:1 chat with the sender.
         warn!(
             context,
             "not creating ad-hoc group for message that cannot be decrypted"

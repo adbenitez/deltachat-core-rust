@@ -1,3 +1,4 @@
+#![deny(clippy::all)]
 #![allow(
     non_camel_case_types,
     non_snake_case,
@@ -486,7 +487,7 @@ pub unsafe extern "C" fn dc_get_next_event(events: *mut dc_event_emitter_t) -> *
     events
         .recv_sync()
         .map(|ev| Box::into_raw(Box::new(ev)))
-        .unwrap_or_else(|| ptr::null_mut())
+        .unwrap_or_else(ptr::null_mut)
 }
 
 #[no_mangle]
@@ -706,6 +707,25 @@ pub unsafe extern "C" fn dc_send_text_msg(
             .await
             .map(|msg_id| msg_id.to_u32())
             .unwrap_or_log_default(&ctx, "Failed to send text message")
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_send_videochat_invitation(
+    context: *mut dc_context_t,
+    chat_id: u32,
+) -> u32 {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_send_videochat_invitation()");
+        return 0;
+    }
+    let ctx = &*context;
+
+    block_on(async move {
+        chat::send_videochat_invitation(&ctx, ChatId::new(chat_id))
+            .await
+            .map(|msg_id| msg_id.to_u32())
+            .unwrap_or_log_default(&ctx, "Failed to send video chat invitation")
     })
 }
 
@@ -2817,6 +2837,31 @@ pub unsafe extern "C" fn dc_msg_is_setupmessage(msg: *mut dc_msg_t) -> libc::c_i
     }
     let ffi_msg = &*msg;
     ffi_msg.message.is_setupmessage().into()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_msg_get_videochat_url(msg: *mut dc_msg_t) -> *mut libc::c_char {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_videochat_url()");
+        return "".strdup();
+    }
+    let ffi_msg = &*msg;
+
+    ffi_msg
+        .message
+        .get_videochat_url()
+        .unwrap_or_default()
+        .strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_msg_get_videochat_type(msg: *mut dc_msg_t) -> libc::c_int {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_videochat_type()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    ffi_msg.message.get_videochat_type().unwrap_or_default() as i32
 }
 
 #[no_mangle]

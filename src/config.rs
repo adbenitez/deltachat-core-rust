@@ -122,6 +122,9 @@ pub enum Config {
     /// Whether we send a warning if the password is wrong (set to false when we send a warning
     /// because we do not want to send a second warning)
     NotifyAboutWrongPw,
+
+    /// address to webrtc instance to use for videochats
+    WebrtcInstance,
 }
 
 impl Context {

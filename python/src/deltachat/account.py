@@ -246,7 +246,6 @@ class Account(object):
         addr = as_dc_charpointer(addr)
         name = as_dc_charpointer(name)
         contact_id = lib.dc_create_contact(self._dc_context, name, addr)
-        assert contact_id > const.DC_CHAT_ID_LAST_SPECIAL, contact_id
         return Contact(self, contact_id)
 
     def delete_contact(self, contact):
@@ -607,12 +606,24 @@ class Account(object):
         self.stop_io()
 
         self.log("remove dc_context references")
-        # the dc_context_unref triggers get_next_event to return ffi.NULL
-        # which in turns makes the event thread finish execution
+
+        # if _dc_context is unref'ed the event thread should quickly
+        # receive the termination signal. However, some python code might
+        # still hold a reference and so we use a secondary signal
+        # to make sure the even thread terminates if it receives any new
+        # event, indepedently from waiting for the core to send NULL to
+        # get_next_event().
+        self._event_thread.mark_shutdown()
         self._dc_context = None
 
         self.log("wait for event thread to finish")
-        self._event_thread.wait()
+        try:
+            self._event_thread.wait(timeout=2)
+        except RuntimeError as e:
+            self.log("Waiting for event thread failed: {}".format(e))
+
+        if self._event_thread.is_alive():
+            self.log("WARN: event thread did not terminate yet, ignoring.")
 
         self._shutdown_event.set()
 
