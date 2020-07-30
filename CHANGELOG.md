@@ -1,5 +1,51 @@
 # Changelog 
 
+## 1.42.0
+
+- new qr-code type `DC_QR_WEBRTC` #1779
+
+- new `dc_chatlist_get_summary2()` api #1771
+
+- tweak smtp-timeout for larger mails #1782
+
+- optimize read-receipts #1756
+
+- Allow http scheme for DCACCOUNT URLs #1770
+
+- improve tests #1769
+
+- bug fixes #1766 #1772 #1773 #1775 #1776 #1777
+
+
+## 1.41.0
+
+- new apis to initiate video chats #1718 #1735
+
+- new apis `dc_msg_get_ephemeral_timer()`
+  and `dc_msg_get_ephemeral_timestamp()`
+
+- new api `dc_chatlist_get_summary2()` #1771
+
+- improve IMAP handling #1703 #1704
+
+- improve ephemeral messages #1696 #1705
+
+- mark location-messages as auto-generated #1715
+
+- multi-device avatar-sync #1716 #1717
+
+- improve python bindings #1732 #1733 #1738 #1769
+
+- Allow http scheme for DCACCOUNT urls #1770
+
+- more fixes #1702 #1706 #1707 #1710 #1719 #1721
+  #1723 #1734 #1740 #1744 #1748 #1760 #1766 #1773 #1765
+
+- refactorings #1712 #1714 #1757
+
+- update toolchains and dependencies #1726 #1736 #1737 #1742 #1743 #1746
+
+
 ## 1.40.0
 
 - introduce ephemeral messages #1540 #1680 #1683 #1684 #1691 #1692
