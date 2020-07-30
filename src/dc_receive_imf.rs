@@ -1148,9 +1148,9 @@ async fn create_or_lookup_group(
     }
 
     // check if the group does not exist but should be created
-    let group_explicitly_left = chat::is_group_explicitly_left(context, &grpid)
-        .await
-        .unwrap_or_default();
+    // let group_explicitly_left = chat::is_group_explicitly_left(context, &grpid)
+    //     .await
+    //     .unwrap_or_default();
     let self_addr = context
         .get_config(Config::ConfiguredAddr)
         .await
