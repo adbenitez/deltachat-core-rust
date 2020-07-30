@@ -375,12 +375,13 @@ int             dc_set_stock_translation(dc_context_t* context, uint32_t stock_i
 
 
 /**
- * Set configuration values from a QR code containing an account.
+ * Set configuration values from a QR code.
  * Before this function is called, dc_check_qr() should confirm the type of the
- * QR code is DC_QR_ACCOUNT.
+ * QR code is DC_QR_ACCOUNT or DC_QR_WEBRTC_INSTANCE.
  *
- * Internally, the function will call dc_set_config()
- * at least with the keys `addr` and `mail_pw`.
+ * Internally, the function will call dc_set_config() with the appropriate keys,
+ * eg. `addr` and `mail_pw` for DC_QR_ACCOUNT
+ * or `webrtc_instance` for DC_QR_WEBRTC_INSTANCE.
  *
  * @memberof dc_context_t
  * @param context The context object
@@ -1927,6 +1928,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_FPR_MISMATCH           220 // id=contact
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
 #define         DC_QR_ACCOUNT                250 // text1=domain
+#define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain
 #define         DC_QR_ADDR                   320 // id=contact
 #define         DC_QR_TEXT                   330 // text1=text
 #define         DC_QR_URL                    332 // text1=URL
@@ -1945,6 +1947,9 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  * - DC_QR_FPR_MISMATCH with dc_lot_t::id=Contact ID
  * - DC_QR_FPR_WITHOUT_ADDR with dc_lot_t::test1=Formatted fingerprint
  * - DC_QR_ACCOUNT allows creation of an account, dc_lot_t::text1=domain
+ * - DC_QR_WEBRTC_INSTANCE - a shared webrtc-instance
+ *   that will be set if dc_set_config_from_qr() is called with the qr-code,
+ *   dc_lot_t::text1=domain could be used to ask the user
  * - DC_QR_ADDR with dc_lot_t::id=Contact ID
  * - DC_QR_TEXT with dc_lot_t::text1=Text
  * - DC_QR_URL with dc_lot_t::text1=URL
@@ -2468,6 +2473,28 @@ uint32_t         dc_chatlist_get_msg_id      (const dc_chatlist_t* chatlist, siz
  * @return The summary as an dc_lot_t object. Must be freed using dc_lot_unref().  NULL is never returned.
  */
 dc_lot_t*        dc_chatlist_get_summary     (const dc_chatlist_t* chatlist, size_t index, dc_chat_t* chat);
+
+
+/**
+ * Create a chatlist summary item when the chatlist object is already unref()'d.
+ *
+ * This function is similar to dc_chatlist_get_summary(), however,
+ * takes the chat-id and message-id as returned by dc_chatlist_get_chat_id() and dc_chatlist_get_msg_id()
+ * as arguments. The chatlist object itself is not needed directly.
+ *
+ * This maybe useful if you convert the complete object into a different represenation
+ * as done eg. in the node-bindings.
+ * If you have access to the chatlist object in some way, using this function is not recommended,
+ * use dc_chatlist_get_summary() in this case instead.
+ *
+ * @memberof dc_context_t
+ * @param context The context as created by dc_context_new()
+ * @param chat_id Chat to get a summary for.
+ * @param msg_id Messasge to get a summary for.
+ * @return The summary as an dc_lot_t object, see dc_chatlist_get_summary() for details.
+ *     Must be freed using dc_lot_unref().  NULL is never returned.
+ */
+dc_lot_t*        dc_chatlist_get_summary2    (dc_context_t* context, uint32_t chat_id, uint32_t msg_id);
 
 
 /**
