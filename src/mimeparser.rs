@@ -131,7 +131,10 @@ impl MimeMessage {
         let (mail, signatures) = match e2ee::try_decrypt(context, &mail, message_time).await {
             Ok((raw, signatures)) => {
                 if let Some(raw) = raw {
-                    // Valid autocrypt message, encrypted
+                    // Encrypted, but maybe unsigned message. Only if
+                    // `signatures` set is non-empty, it is a valid
+                    // autocrypt message.
+
                     mail_raw = raw;
                     let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
                     if std::env::var(crate::DCC_MIME_DEBUG).is_ok() {
@@ -141,18 +144,27 @@ impl MimeMessage {
 
                     // Handle any gossip headers if the mail was encrypted.  See section
                     // "3.6 Key Gossip" of https://autocrypt.org/autocrypt-spec-1.1.0.pdf
-                    let gossip_headers = decrypted_mail.headers.get_all_values("Autocrypt-Gossip");
-                    gossipped_addr =
-                        update_gossip_peerstates(context, message_time, &mail, gossip_headers)
-                            .await?;
+                    // but only if the mail was correctly signed:
+                    if !signatures.is_empty() {
+                        let gossip_headers =
+                            decrypted_mail.headers.get_all_values("Autocrypt-Gossip");
+                        gossipped_addr =
+                            update_gossip_peerstates(context, message_time, &mail, gossip_headers)
+                                .await?;
+                    }
 
                     // let known protected headers from the decrypted
                     // part override the unencrypted top-level
+
+                    // Signature was checked for original From, so we
+                    // do not allow overriding it.
+                    let mut throwaway_from = from.clone();
+
                     MimeMessage::merge_headers(
                         context,
                         &mut headers,
                         &mut recipients,
-                        &mut from,
+                        &mut throwaway_from,
                         &mut chat_disposition_notification_to,
                         &decrypted_mail.headers,
                     );
@@ -199,6 +211,12 @@ impl MimeMessage {
         parser.parse_mime_recursive(context, &mail).await?;
         parser.heuristically_parse_ndn(context).await;
         parser.parse_headers(context)?;
+
+        if parser.signatures.is_empty() {
+            for part in parser.parts.iter_mut() {
+                part.error = "No valid signature".to_string();
+            }
+        }
 
         Ok(parser)
     }
