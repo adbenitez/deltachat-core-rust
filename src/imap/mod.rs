@@ -573,8 +573,14 @@ impl Imap {
                     let set = format!("{}", mailbox.exists);
                     match session.fetch(set, JUST_UID).await {
                         Ok(mut list) => {
-                            if let Some(Ok(msg)) = list.next().await {
-                                msg.uid.unwrap_or_default()
+                            let mut new_last_seen_uid = None;
+                            while let Some(fetch) = list.next().await.transpose()? {
+                                if fetch.message == mailbox.exists && fetch.uid.is_some() {
+                                    new_last_seen_uid = fetch.uid;
+                                }
+                            }
+                            if let Some(new_last_seen_uid) = new_last_seen_uid {
+                                new_last_seen_uid
                             } else {
                                 return Err(Error::Other("failed to fetch".into()));
                             }
@@ -970,7 +976,11 @@ impl Imap {
         if let Some(ref mut session) = &mut self.session {
             let query = format!("+FLAGS ({})", flag);
             match session.uid_store(uid_set, &query).await {
-                Ok(_) => {}
+                Ok(mut responses) => {
+                    while let Some(_response) = responses.next().await {
+                        // Read all the responses
+                    }
+                }
                 Err(err) => {
                     warn!(
                         context,
@@ -1073,8 +1083,35 @@ impl Imap {
         if let Some(ref mut session) = &mut self.session {
             match session.uid_fetch(set, DELETE_CHECK_FLAGS).await {
                 Ok(mut msgs) => {
-                    let fetch = if let Some(Ok(fetch)) = msgs.next().await {
-                        fetch
+                    let mut remote_message_id = None;
+
+                    while let Some(response) = msgs.next().await {
+                        match response {
+                            Ok(fetch) => {
+                                if fetch.uid == Some(uid) {
+                                    remote_message_id = get_fetch_headers(&fetch)
+                                        .and_then(|headers| prefetch_get_message_id(&headers))
+                                        .ok();
+                                }
+                            }
+                            Err(err) => {
+                                warn!(context, "IMAP fetch error {}", err);
+                                return ImapActionResult::RetryLater;
+                            }
+                        }
+                    }
+
+                    if let Some(remote_message_id) = remote_message_id {
+                        if remote_message_id != message_id {
+                            warn!(
+                                context,
+                                "Cannot delete on IMAP, {}: remote message-id '{}' != '{}'",
+                                display_imap_id,
+                                remote_message_id,
+                                message_id,
+                            );
+                            return ImapActionResult::Failed;
+                        }
                     } else {
                         warn!(
                             context,
@@ -1083,21 +1120,6 @@ impl Imap {
                             message_id,
                         );
                         return ImapActionResult::AlreadyDone;
-                    };
-
-                    let remote_message_id = get_fetch_headers(&fetch)
-                        .and_then(|headers| prefetch_get_message_id(&headers))
-                        .unwrap_or_default();
-
-                    if remote_message_id != message_id {
-                        warn!(
-                            context,
-                            "Cannot delete on IMAP, {}: remote message-id '{}' != '{}'",
-                            display_imap_id,
-                            remote_message_id,
-                            message_id,
-                        );
-                        return ImapActionResult::Failed;
                     }
                 }
                 Err(err) => {
