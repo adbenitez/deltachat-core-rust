@@ -284,7 +284,9 @@ async fn log_contactlist(context: &Context, contacts: &[u32]) {
                     "addr unset"
                 }
             );
-            let peerstate = Peerstate::from_addr(context, &addr).await;
+            let peerstate = Peerstate::from_addr(context, &addr)
+                .await
+                .expect("peerstate error");
             if peerstate.is_some() && contact_id != 1 as libc::c_uint {
                 line2 = format!(
                     ", prefer-encrypt={}",

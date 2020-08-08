@@ -366,7 +366,20 @@ async fn fingerprint_equals_sender(
 ) -> bool {
     if let [contact_id] = chat::get_chat_contacts(context, contact_chat_id).await[..] {
         if let Ok(contact) = Contact::load_from_db(context, contact_id).await {
-            if let Some(peerstate) = Peerstate::from_addr(context, contact.get_addr()).await {
+            let peerstate = match Peerstate::from_addr(context, contact.get_addr()).await {
+                Ok(peerstate) => peerstate,
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Failed to sender peerstate for {}: {}",
+                        contact.get_addr(),
+                        err
+                    );
+                    return false;
+                }
+            };
+
+            if let Some(peerstate) = peerstate {
                 if peerstate.public_key_fingerprint.is_some()
                     && fingerprint == peerstate.public_key_fingerprint.as_ref().unwrap()
                 {
@@ -974,7 +987,7 @@ async fn could_not_establish_secure_connection(
 
 async fn mark_peer_as_verified(context: &Context, fingerprint: &Fingerprint) -> Result<(), Error> {
     if let Some(ref mut peerstate) =
-        Peerstate::from_fingerprint(context, &context.sql, fingerprint).await
+        Peerstate::from_fingerprint(context, &context.sql, fingerprint).await?
     {
         if peerstate.set_verified(
             PeerstateKeyType::PublicKey,
