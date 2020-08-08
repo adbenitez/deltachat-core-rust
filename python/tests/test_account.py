@@ -276,14 +276,22 @@ class TestOfflineChat:
     def test_mute(self, ac1):
         chat = ac1.create_group_chat(name="title1")
         assert not chat.is_muted()
+        assert chat.get_mute_duration() == 0
         chat.mute()
         assert chat.is_muted()
+        assert chat.get_mute_duration() == -1
         chat.unmute()
         assert not chat.is_muted()
         chat.mute(50)
         assert chat.is_muted()
+        assert chat.get_mute_duration() <= 50
         with pytest.raises(ValueError):
             chat.mute(-51)
+
+        # Regression test, this caused Rust panic previously
+        chat.mute(2**63 - 1)
+        assert chat.is_muted()
+        assert chat.get_mute_duration() == -1
 
     def test_delete_and_send_fails(self, ac1, chat1):
         chat1.delete()
@@ -1661,15 +1669,11 @@ class TestOnlineAccount:
         for text in texts:
             chat12.send_text(text)
 
-            # Ensure messages are delivered in exactly this order.
-            ac1._evtracker.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
-            ac1._evtracker.get_matching("DC_EVENT_MSG_DELIVERED")
-
         lp.sec("ac2: waiting for all messages on the other side")
         to_delete = []
         for text in texts:
             msg = ac2._evtracker.wait_next_incoming_message()
-            assert msg.text == text
+            assert msg.text in texts
             if text != "third":
                 to_delete.append(msg)
 
@@ -1683,14 +1687,6 @@ class TestOnlineAccount:
 
         lp.sec("imap2: test that only one message is left")
         imap2 = ac2.direct_imap
-
-        # Flush unsolicited responses. IMAPClient has problems
-        # dealing with them: https://github.com/mjs/imapclient/issues/334
-        # When this NOOP was introduced, next FETCH returned empty
-        # result instead of a single message, even though IMAP server
-        # can only return more untagged responses than required, not
-        # less.
-        imap2.conn.noop()
 
         assert len(imap2.get_all_messages()) == 1
 
