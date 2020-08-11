@@ -12,7 +12,7 @@ use crate::contact::*;
 use crate::context::*;
 use crate::dc_tools::*;
 use crate::error::{ensure, Error};
-use crate::events::Event;
+use crate::events::EventType;
 use crate::job::{self, Action};
 use crate::lot::{Lot, LotState, Meaning};
 use crate::mimeparser::{FailureReport, SystemMessage};
@@ -1118,7 +1118,7 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) {
     }
 
     if !msg_ids.is_empty() {
-        context.emit_event(Event::MsgsChanged {
+        context.emit_event(EventType::MsgsChanged {
             chat_id: ChatId::new(0),
             msg_id: MsgId::new(0),
         });
@@ -1209,7 +1209,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> bool {
     }
 
     if send_event {
-        context.emit_event(Event::MsgsChanged {
+        context.emit_event(EventType::MsgsChanged {
             chat_id: ChatId::new(0),
             msg_id: MsgId::new(0),
         });
@@ -1376,7 +1376,7 @@ pub async fn set_msg_failed(context: &Context, msg_id: MsgId, error: Option<impl
             )
             .await
         {
-            Ok(_) => context.emit_event(Event::MsgFailed {
+            Ok(_) => context.emit_event(EventType::MsgFailed {
                 chat_id: msg.chat_id,
                 msg_id,
             }),
@@ -1551,7 +1551,7 @@ pub(crate) async fn handle_ndn(
                             .await,
                     )
                     .await;
-                    context.emit_event(Event::ChatModified(chat_id));
+                    context.emit_event(EventType::ChatModified(chat_id));
                 }
             }
         }
@@ -1732,6 +1732,7 @@ pub async fn dc_empty_server(context: &Context, flags: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::ChatItem;
     use crate::test_utils as test;
 
     #[test]
@@ -1873,5 +1874,36 @@ mod tests {
         let (webrtc_type, url) = Message::parse_webrtc_instance("jitsi:https://j.si/foo");
         assert_eq!(webrtc_type, VideochatType::Jitsi);
         assert_eq!(url, "https://j.si/foo");
+    }
+
+    #[async_std::test]
+    async fn test_get_width_height() {
+        let t = test::TestContext::new().await;
+
+        // test that get_width() and get_height() are returning some dimensions for images;
+        // (as the device-chat contains a welcome-images, we check that)
+        t.ctx.update_device_chats().await.ok();
+        let (device_chat_id, _) =
+            chat::create_or_lookup_by_contact_id(&t.ctx, DC_CONTACT_ID_DEVICE, Blocked::Not)
+                .await
+                .unwrap();
+
+        let mut has_image = false;
+        let chatitems = chat::get_chat_msgs(&t.ctx, device_chat_id, 0, None).await;
+        for chatitem in chatitems {
+            if let ChatItem::Message { msg_id } = chatitem {
+                if let Ok(msg) = Message::load_from_db(&t.ctx, msg_id.clone()).await {
+                    if msg.get_viewtype() == Viewtype::Image {
+                        has_image = true;
+                        // just check that width/height are inside some reasonable ranges
+                        assert!(msg.get_width() > 100);
+                        assert!(msg.get_height() > 100);
+                        assert!(msg.get_width() < 4000);
+                        assert!(msg.get_height() < 4000);
+                    }
+                }
+            }
+        }
+        assert!(has_image);
     }
 }
