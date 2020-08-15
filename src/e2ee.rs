@@ -15,7 +15,6 @@ use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
 use crate::keyring::*;
 use crate::peerstate::*;
 use crate::pgp;
-use crate::securejoin::handle_degrade_event;
 
 #[derive(Debug)]
 pub struct EncryptHelper {
@@ -166,13 +165,10 @@ pub async fn try_decrypt(
         peerstate = Peerstate::from_addr(&context, &from).await?;
     }
     if let Some(peerstate) = peerstate {
-        if peerstate.degrade_event.is_some() {
-            handle_degrade_event(context, &peerstate).await?;
-        }
-        if let Some(key) = peerstate.gossip_key {
-            public_keyring_for_validate.add(key);
-        }
+        peerstate.handle_fingerprint_change(context).await?;
         if let Some(key) = peerstate.public_key {
+            public_keyring_for_validate.add(key);
+        } else if let Some(key) = peerstate.gossip_key {
             public_keyring_for_validate.add(key);
         }
     }
