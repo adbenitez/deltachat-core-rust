@@ -439,6 +439,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         unprotected_headers.push(Header::new("MIME-Version".into(), "1.0".into()));
 
         if !self.references.is_empty() {
+
             unprotected_headers.push(Header::new("References".into(), self.references.clone()));
         }
 
@@ -504,7 +505,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             unprotected_headers.push(Header::new("Autocrypt".into(), aheader));
         }
 
-        protected_headers.push(Header::new("Subject".into(), subject));
+        if self.context.get_config_bool(Config::E2eeEnabled).await {
+            protected_headers.push(Header::new("Subject".into(), subject));
+        }
 
         let peerstates = self.peerstates_for_recipients().await?;
         let should_encrypt =
