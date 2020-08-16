@@ -23,7 +23,6 @@ use crate::location;
 use crate::message;
 use crate::param::*;
 use crate::peerstate::Peerstate;
-use crate::securejoin::handle_degrade_event;
 use crate::simplify::*;
 use crate::stock::StockMessage;
 
@@ -159,6 +158,10 @@ impl MimeMessage {
                     // Signature was checked for original From, so we
                     // do not allow overriding it.
                     let mut throwaway_from = from.clone();
+
+                    // We do not want to allow unencrypted subject in encrypted emails because the user might falsely think that the subject is safe.
+                    // See https://github.com/deltachat/deltachat-core-rust/issues/1790.
+                    headers.remove("subject");
 
                     MimeMessage::merge_headers(
                         context,
@@ -1043,9 +1046,7 @@ async fn update_gossip_peerstates(
                     peerstate = Some(p);
                 }
                 if let Some(peerstate) = peerstate {
-                    if peerstate.degrade_event.is_some() {
-                        handle_degrade_event(context, &peerstate).await?;
-                    }
+                    peerstate.handle_fingerprint_change(context).await?;
                 }
 
                 gossipped_addr.insert(header.addr.clone());
