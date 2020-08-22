@@ -1118,7 +1118,7 @@ pub fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)> {
         "vcard" => (Viewtype::File, "text/vcard"),
         "vcf" => (Viewtype::File, "text/vcard"),
         "webm" => (Viewtype::Video, "video/webm"),
-        "webp" => (Viewtype::Image, "image/webp"),
+        "webp" => (Viewtype::Sticker, "image/webp"),
         "wmv" => (Viewtype::Video, "video/x-ms-wmv"),
         _ => {
             return None;
