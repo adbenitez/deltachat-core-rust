@@ -1096,30 +1096,70 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> String {
 pub fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)> {
     let extension: &str = &path.extension()?.to_str()?.to_lowercase();
     let info = match extension {
+        // before using viewtype other than Viewtype::File,
+        // make sure, all target UIs support that type in the context of the used viewer/player.
+        // if in doubt, it is better to default to Viewtype::File that passes handing to an external app.
+        // (cmp. https://developer.android.com/guide/topics/media/media-formats )
         "3gp" => (Viewtype::Video, "video/3gpp"),
         "aac" => (Viewtype::Audio, "audio/aac"),
         "avi" => (Viewtype::Video, "video/x-msvideo"),
+        "doc" => (Viewtype::File, "application/msword"),
+        "docx" => (
+            Viewtype::File,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        "epub" => (Viewtype::File, "application/epub+zip"),
         "flac" => (Viewtype::Audio, "audio/flac"),
         "gif" => (Viewtype::Gif, "image/gif"),
+        "html" => (Viewtype::File, "text/html"),
+        "htm" => (Viewtype::File, "text/html"),
+        "ico" => (Viewtype::File, "image/vnd.microsoft.icon"),
+        "jar" => (Viewtype::File, "application/java-archive"),
         "jpeg" => (Viewtype::Image, "image/jpeg"),
         "jpe" => (Viewtype::Image, "image/jpeg"),
         "jpg" => (Viewtype::Image, "image/jpeg"),
+        "json" => (Viewtype::File, "application/json"),
         "mov" => (Viewtype::Video, "video/quicktime"),
         "mp3" => (Viewtype::Audio, "audio/mpeg"),
         "mp4" => (Viewtype::Video, "video/mp4"),
+        "odp" => (
+            Viewtype::File,
+            "application/vnd.oasis.opendocument.presentation",
+        ),
+        "ods" => (
+            Viewtype::File,
+            "application/vnd.oasis.opendocument.spreadsheet",
+        ),
+        "odt" => (Viewtype::File, "application/vnd.oasis.opendocument.text"),
         "oga" => (Viewtype::Audio, "audio/ogg"),
         "ogg" => (Viewtype::Audio, "audio/ogg"),
-        "ogv" => (Viewtype::Video, "video/ogg"),
-        "opus" => (Viewtype::Audio, "audio/ogg"),
+        "ogv" => (Viewtype::File, "video/ogg"),
+        "opus" => (Viewtype::File, "audio/ogg"), // not supported eg. on Android 4
+        "otf" => (Viewtype::File, "font/otf"),
+        "pdf" => (Viewtype::File, "application/pdf"),
         "png" => (Viewtype::Image, "image/png"),
-        "spx" => (Viewtype::Audio, "audio/ogg"), // Ogg Speex Profile
-        "svg" => (Viewtype::Image, "image/svg+xml"),
+        "rar" => (Viewtype::File, "application/vnd.rar"),
+        "rtf" => (Viewtype::File, "application/rtf"),
+        "spx" => (Viewtype::File, "audio/ogg"), // Ogg Speex Profile
+        "svg" => (Viewtype::File, "image/svg+xml"),
         "tgs" => (Viewtype::Sticker, "application/x-tgsticker"),
+        "tiff" => (Viewtype::File, "image/tiff"),
+        "tif" => (Viewtype::File, "image/tiff"),
+        "ttf" => (Viewtype::File, "font/ttf"),
         "vcard" => (Viewtype::File, "text/vcard"),
         "vcf" => (Viewtype::File, "text/vcard"),
+        "wav" => (Viewtype::File, "audio/wav"),
+        "weba" => (Viewtype::File, "audio/webm"),
         "webm" => (Viewtype::Video, "video/webm"),
         "webp" => (Viewtype::Sticker, "image/webp"),
         "wmv" => (Viewtype::Video, "video/x-ms-wmv"),
+        "xhtml" => (Viewtype::File, "application/xhtml+xml"),
+        "xlsx" => (
+            Viewtype::File,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        "xml" => (Viewtype::File, "application/vnd.ms-excel"),
+        "zip" => (Viewtype::File, "application/zip"),
         _ => {
             return None;
         }
