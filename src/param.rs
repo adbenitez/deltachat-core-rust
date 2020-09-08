@@ -95,6 +95,12 @@ pub enum Param {
     Recipients = b'R',
 
     /// For Groups
+    ///
+    /// An unpromoted group has not had any messages sent to it and thus only exists on the
+    /// creator's device.  Any changes made to an unpromoted group do not need to send
+    /// system messages to the group members to update them of the changes.  Once a message
+    /// has been sent to a group it is promoted and group changes require sending system
+    /// messages to all members.
     Unpromoted = b'U',
 
     /// For Groups and Contacts
@@ -469,8 +475,8 @@ mod tests {
         );
 
         // Blob in blobdir, expect blob.
-        let bar = t.ctx.get_blobdir().join("bar");
-        p.set(Param::File, bar.to_str().unwrap());
+        let bar_path = t.ctx.get_blobdir().join("bar");
+        p.set(Param::File, bar_path.to_str().unwrap());
         let blob = p
             .get_blob(Param::File, &t.ctx, false)
             .await
