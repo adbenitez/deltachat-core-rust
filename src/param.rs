@@ -40,9 +40,11 @@ pub enum Param {
     /// 'c' nor 'e' are preset, the messages is only transport encrypted.
     ErroneousE2ee = b'e',
 
-    /// For Messages: force unencrypted message, either `ForcePlaintext::AddAutocryptHeader` (1),
-    /// `ForcePlaintext::NoAutocryptHeader` (2) or 0.
+    /// For Messages: force unencrypted message, a value from `ForcePlaintext` enum.
     ForcePlaintext = b'u',
+
+    /// For Messages: do not include Autocrypt header.
+    SkipAutocrypt = b'o',
 
     /// For Messages
     WantsMdn = b'r',
@@ -126,14 +128,6 @@ pub enum Param {
 
     /// For MDN-sending job
     MsgId = b'I',
-}
-
-/// Possible values for `Param::ForcePlaintext`.
-#[derive(PartialEq, Eq, Debug, Clone, Copy, FromPrimitive)]
-#[repr(u8)]
-pub enum ForcePlaintext {
-    AddAutocryptHeader = 1,
-    NoAutocryptHeader = 2,
 }
 
 /// An object for handling key=value parameter lists.

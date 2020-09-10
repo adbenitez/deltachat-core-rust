@@ -842,7 +842,11 @@ impl Chat {
             /* check if we want to encrypt this message.  If yes and circumstances change
             so that E2EE is no longer available at a later point (reset, changed settings),
             we might not send the message out at all */
-            if msg.param.get_int(Param::ForcePlaintext).unwrap_or_default() == 0 {
+            if !msg
+                .param
+                .get_bool(Param::ForcePlaintext)
+                .unwrap_or_default()
+            {
                 let mut can_encrypt = true;
                 let mut all_mutual = context.get_config_bool(Config::E2eeEnabled).await;
 
