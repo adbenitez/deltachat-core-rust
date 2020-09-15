@@ -2360,7 +2360,7 @@ dc_context_t*  dc_accounts_get_account          (dc_accounts_t* accounts, uint32
 
 /**
  * Get the currently selected account.
- * If there is at least once account in the account-manager,
+ * If there is at least one account in the account-manager,
  * there is always a selected one.
  * To change the selected account, use dc_accounts_select_account();
  * also adding/importing/migrating accounts may change the selection.
@@ -4669,7 +4669,7 @@ void dc_event_unref(dc_event_t* event);
  * Inform about the configuration progress started by dc_configure().
  *
  * @param data1 (int) 0=error, 1-999=progress in permille, 1000=success and done
- * @param data2 0
+ * @param data2 (char*) progress comment, error message or NULL if not applicable
  */
 #define DC_EVENT_CONFIGURE_PROGRESS       2041
 
@@ -4733,7 +4733,7 @@ void dc_event_unref(dc_event_t* event);
 
 
 #define DC_EVENT_DATA1_IS_STRING(e)  0    // not used anymore 
-#define DC_EVENT_DATA2_IS_STRING(e)  ((e)==DC_EVENT_IMEX_FILE_WRITTEN || ((e)>=100 && (e)<=499))
+#define DC_EVENT_DATA2_IS_STRING(e)  ((e)==DC_EVENT_CONFIGURE_PROGRESS || (e)==DC_EVENT_IMEX_FILE_WRITTEN || ((e)>=100 && (e)<=499))
 
 
 /*
@@ -4924,8 +4924,9 @@ void dc_event_unref(dc_event_t* event);
 #define DC_STR_EPHEMERAL_FOUR_WEEKS       81
 #define DC_STR_VIDEOCHAT_INVITATION       82
 #define DC_STR_VIDEOCHAT_INVITE_MSG_BODY  83
+#define DC_STR_CONFIGURATION_FAILED       84
 
-#define DC_STR_COUNT                      83
+#define DC_STR_COUNT                      84
 
 /*
  * @}
