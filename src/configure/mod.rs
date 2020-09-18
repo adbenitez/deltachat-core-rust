@@ -20,19 +20,26 @@ use crate::message::Message;
 use crate::oauth2::*;
 use crate::provider::{Protocol, Socket, UsernamePattern};
 use crate::smtp::Smtp;
+use crate::stock::StockMessage;
 use crate::{chat, e2ee, provider};
 
 use auto_mozilla::moz_autoconfigure;
 use auto_outlook::outlk_autodiscover;
-use server_params::ServerParams;
+use server_params::{expand_param_vector, ServerParams};
 
 macro_rules! progress {
-    ($context:tt, $progress:expr) => {
+    ($context:tt, $progress:expr, $comment:expr) => {
         assert!(
             $progress <= 1000,
             "value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success"
         );
-        $context.emit_event($crate::events::EventType::ConfigureProgress($progress));
+        $context.emit_event($crate::events::EventType::ConfigureProgress {
+            progress: $progress,
+            comment: $comment,
+        });
+    };
+    ($context:tt, $progress:expr) => {
+        progress!($context, $progress, None);
     };
 }
 
@@ -111,7 +118,17 @@ impl Context {
                 Ok(())
             }
             Err(err) => {
-                progress!(self, 0);
+                progress!(
+                    self,
+                    0,
+                    Some(
+                        self.stock_string_repl_str(
+                            StockMessage::ConfigurationFailed,
+                            err.to_string(),
+                        )
+                        .await
+                    )
+                );
                 Err(err)
             }
         }
@@ -194,8 +211,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     progress!(ctx, 500);
 
-    let servers: Vec<ServerParams> = param_autoconfig
-        .unwrap_or_else(|| {
+    let servers = expand_param_vector(
+        param_autoconfig.unwrap_or_else(|| {
             vec![
                 ServerParams {
                     protocol: Protocol::IMAP,
@@ -212,18 +229,12 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
                     username: param.smtp.user.clone(),
                 },
             ]
-        })
-        .into_iter()
-        // The order of expansion is important: ports are expanded the
-        // last, so they are changed the first. Username is only
-        // changed if default value (address with domain) didn't work
-        // for all available hosts and ports.
-        .flat_map(|params| params.expand_usernames(&param.addr).into_iter())
-        .flat_map(|params| params.expand_hostnames(&param_domain).into_iter())
-        .flat_map(|params| params.expand_ports().into_iter())
-        .collect();
+        }),
+        &param.addr,
+        &param_domain,
+    );
 
-    progress!(ctx, 600);
+    progress!(ctx, 550);
 
     // Spawn SMTP configuration task
     let mut smtp = Smtp::new();
@@ -258,15 +269,19 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         }
     });
 
+    progress!(ctx, 600);
+
     // Configure IMAP
     let (_s, r) = async_std::sync::channel(1);
     let mut imap = Imap::new(r);
 
     let mut imap_configured = false;
-    for imap_server in servers
+    let imap_servers: Vec<&ServerParams> = servers
         .iter()
         .filter(|params| params.protocol == Protocol::IMAP)
-    {
+        .collect();
+    let imap_servers_count = imap_servers.len();
+    for (imap_server_index, imap_server) in imap_servers.into_iter().enumerate() {
         param.imap.user = imap_server.username.clone();
         param.imap.server = imap_server.hostname.clone();
         param.imap.port = imap_server.port;
@@ -276,10 +291,16 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             imap_configured = true;
             break;
         }
+        progress!(
+            ctx,
+            600 + (800 - 600) * (1 + imap_server_index) / imap_servers_count
+        );
     }
     if !imap_configured {
         bail!("IMAP autoconfig did not succeed");
     }
+
+    progress!(ctx, 850);
 
     // Wait for SMTP configuration
     if let Some(smtp_param) = smtp_config_task.await {
