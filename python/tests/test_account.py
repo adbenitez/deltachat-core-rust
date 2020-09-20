@@ -166,6 +166,16 @@ class TestOfflineContact:
         with pytest.raises(ValueError):
             ac1.create_chat(ac3)
 
+    def test_contact_rename(self, acfactory):
+        ac1 = acfactory.get_configured_offline_account()
+        contact = ac1.create_contact("some1@example.com", name="some1")
+        chat = ac1.create_chat(contact)
+        assert chat.get_name() == "some1"
+        ac1.create_contact("some1@example.com", name="renamed")
+        ev = ac1._evtracker.get_matching("DC_EVENT_CHAT_MODIFIED")
+        assert ev.data1 == chat.id
+        assert chat.get_name() == "renamed"
+
 
 class TestOfflineChat:
     @pytest.fixture
@@ -1417,6 +1427,8 @@ class TestOnlineAccount:
         contact = ac1.create_contact(ac2)
         contact.set_blocked()
         assert contact.is_blocked()
+        ev = ac1._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
+        assert ev.data1 == contact.id
 
         lp.sec("ac2 sends a message to ac1 that does not arrive because it is blocked")
         ac2.create_chat(ac1).send_text("This will not arrive!")
@@ -1750,6 +1762,8 @@ class TestOnlineAccount:
         # Explicitly rename contact on ac2 to "Renamed"
         ac2.create_contact(contact, name="Renamed")
         assert contact.name == "Renamed"
+        ev = ac2._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
+        assert ev.data1 == contact.id
 
         # ac1 also renames itself into "Renamed"
         assert update_name() == "Renamed"

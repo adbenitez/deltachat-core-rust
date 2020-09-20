@@ -247,13 +247,12 @@ impl Contact {
         let (contact_id, sth_modified) =
             Contact::add_or_lookup(context, name, addr, Origin::ManuallyCreated).await?;
         let blocked = Contact::is_blocked_load(context, contact_id).await;
-        context.emit_event(EventType::ContactsChanged(
-            if sth_modified == Modifier::Created {
-                Some(contact_id)
-            } else {
-                None
-            },
-        ));
+        match sth_modified {
+            Modifier::None => {}
+            Modifier::Modified | Modifier::Created => {
+                context.emit_event(EventType::ContactsChanged(Some(contact_id)))
+            }
+        }
         if blocked {
             Contact::unblock(context, contact_id).await;
         }
@@ -457,10 +456,20 @@ impl Contact {
                 if update_name {
                     // Update the contact name also if it is used as a group name.
                     // This is one of the few duplicated data, however, getting the chat list is easier this way.
-                    context.sql.execute(
-                    "UPDATE chats SET name=? WHERE type=? AND id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?);",
-                    paramsv![new_name, Chattype::Single, row_id]
-                ).await.ok();
+                    let chat_id = context.sql.query_get_value::<i32>(
+                        context,
+                        "SELECT id FROM chats WHERE type=? AND id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?)",
+                        paramsv![Chattype::Single, row_id]
+                    ).await;
+                    if let Some(chat_id) = chat_id {
+                        match context.sql.execute("UPDATE chats SET name=? WHERE id=? AND name!=?1", paramsv![new_name, chat_id]).await {
+                            Err(err) => warn!(context, "Can't update chat name: {}", err),
+                            Ok(count) => if count > 0 {
+                                // Chat name updated
+                                context.emit_event(EventType::ChatModified(ChatId::new(chat_id as u32)));
+                            }
+                        }
+                    }
                 }
                 sth_modified = Modifier::Modified;
             }
@@ -1091,12 +1100,12 @@ async fn set_block_contact(context: &Context, contact_id: u32, new_blocking: boo
             // However, I'm not sure about this point; it may be confusing if the user wants to add other people;
             // this would result in recreating the same group...)
             if context.sql.execute(
-                    "UPDATE chats SET blocked=? WHERE type=? AND id IN (SELECT chat_id FROM chats_contacts WHERE contact_id=?);",
-                    paramsv![new_blocking, 100, contact_id as i32],
-                ).await.is_ok() {
-                    Contact::mark_noticed(context, contact_id).await;
-                    context.emit_event(EventType::ContactsChanged(None));
-                }
+                "UPDATE chats SET blocked=? WHERE type=? AND id IN (SELECT chat_id FROM chats_contacts WHERE contact_id=?);",
+                paramsv![new_blocking, 100, contact_id as i32]).await.is_ok()
+            {
+                Contact::mark_noticed(context, contact_id).await;
+                context.emit_event(EventType::ContactsChanged(Some(contact_id)));
+            }
         }
     }
 }
