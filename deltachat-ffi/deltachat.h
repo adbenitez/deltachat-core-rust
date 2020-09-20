@@ -4647,7 +4647,7 @@ void dc_event_unref(dc_event_t* event);
 /**
  * Contact(s) created, renamed, verified, blocked or deleted.
  *
- * @param data1 (int) If not 0, this is the contact_id of an added contact that should be selected.
+ * @param data1 (int) contact_id of the changed contact or 0 on batch-changes or deletion.
  * @param data2 0
  */
 #define DC_EVENT_CONTACTS_CHANGED         2030
@@ -4925,8 +4925,10 @@ void dc_event_unref(dc_event_t* event);
 #define DC_STR_VIDEOCHAT_INVITATION       82
 #define DC_STR_VIDEOCHAT_INVITE_MSG_BODY  83
 #define DC_STR_CONFIGURATION_FAILED       84
+#define DC_STR_BAD_TIME_MSG_BODY          85
+#define DC_STR_UPDATE_REMINDER_MSG_BODY   86
 
-#define DC_STR_COUNT                      84
+#define DC_STR_COUNT                      86
 
 /*
  * @}

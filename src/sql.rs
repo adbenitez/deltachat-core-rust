@@ -142,7 +142,7 @@ impl Sql {
         &self,
     ) -> Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
         let lock = self.pool.read().await;
-        let pool = lock.as_ref().ok_or_else(|| Error::SqlNoConnection)?;
+        let pool = lock.as_ref().ok_or(Error::SqlNoConnection)?;
         let conn = pool.get()?;
 
         Ok(conn)
@@ -156,7 +156,7 @@ impl Sql {
             + FnOnce(r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<H>,
     {
         let lock = self.pool.read().await;
-        let pool = lock.as_ref().ok_or_else(|| Error::SqlNoConnection)?;
+        let pool = lock.as_ref().ok_or(Error::SqlNoConnection)?;
         let conn = pool.get()?;
 
         g(conn)
@@ -168,7 +168,7 @@ impl Sql {
         Fut: Future<Output = Result<H>> + Send,
     {
         let lock = self.pool.read().await;
-        let pool = lock.as_ref().ok_or_else(|| Error::SqlNoConnection)?;
+        let pool = lock.as_ref().ok_or(Error::SqlNoConnection)?;
 
         let conn = pool.get()?;
         g(conn).await
@@ -678,7 +678,10 @@ async fn open(
         .with_flags(open_flags)
         .with_init(|c| {
             c.execute_batch(&format!(
-                "PRAGMA secure_delete=on; PRAGMA busy_timeout = {};",
+                "PRAGMA secure_delete=on;
+                 PRAGMA busy_timeout = {};
+                 PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
+                 ",
                 Duration::from_secs(10).as_millis()
             ))?;
             Ok(())
@@ -713,8 +716,9 @@ async fn open(
                 "First time init: creating tables in {:?}.",
                 dbfile.as_ref(),
             );
-            sql.with_conn(move |conn| {
-                conn.execute_batch(
+            sql.with_conn(move |mut conn| {
+                let tx = conn.transaction()?;
+                tx.execute_batch(
                     r#"
 CREATE TABLE config (id INTEGER PRIMARY KEY, keyname TEXT, value TEXT);
 CREATE INDEX config_index1 ON config (keyname);
@@ -899,6 +903,7 @@ CREATE TABLE devmsglabels (
 CREATE INDEX devmsglabels_index1 ON devmsglabels (label);
 "#,
                 )?;
+                tx.commit()?;
                 Ok(())
             })
             .await?;
