@@ -362,6 +362,7 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::ErrorSelfNotInGroup(_) => 0,
         EventType::MsgsChanged { chat_id, .. }
         | EventType::IncomingMsg { chat_id, .. }
+        | EventType::MsgsNoticed(chat_id)
         | EventType::MsgDelivered { chat_id, .. }
         | EventType::MsgFailed { chat_id, .. }
         | EventType::MsgRead { chat_id, .. }
@@ -407,6 +408,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ConfigureProgress { .. }
         | EventType::ImexProgress(_)
         | EventType::ImexFileWritten(_)
+        | EventType::MsgsNoticed(_)
         | EventType::ChatModified(_) => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::IncomingMsg { msg_id, .. }
@@ -446,6 +448,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         }
         EventType::MsgsChanged { .. }
         | EventType::IncomingMsg { .. }
+        | EventType::MsgsNoticed(_)
         | EventType::MsgDelivered { .. }
         | EventType::MsgFailed { .. }
         | EventType::MsgRead { .. }
@@ -966,22 +969,6 @@ pub unsafe extern "C" fn dc_marknoticed_chat(context: *mut dc_context_t, chat_id
         chat::marknoticed_chat(&ctx, ChatId::new(chat_id))
             .await
             .log_err(ctx, "Failed marknoticed chat")
-            .unwrap_or(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_marknoticed_all_chats(context: *mut dc_context_t) {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_marknoticed_all_chats()");
-        return;
-    }
-    let ctx = &*context;
-
-    block_on(async move {
-        chat::marknoticed_all_chats(&ctx)
-            .await
-            .log_err(ctx, "Failed marknoticed all chats")
             .unwrap_or(())
     })
 }
@@ -3255,7 +3242,8 @@ impl<T: Default, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
 
     fn log_err(self, ctx: &Context, message: &str) -> Result<T, E> {
         self.map_err(|err| {
-            warn!(ctx, "{}: {}", message, err);
+            // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
+            warn!(ctx, "{}: {:#}", message, err);
             err
         })
     }
@@ -3377,7 +3365,8 @@ pub unsafe extern "C" fn dc_accounts_new(
     match accs {
         Ok(accs) => Box::into_raw(Box::new(accs)),
         Err(err) => {
-            eprintln!("failed to create accounts: {}", err);
+            // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
+            eprintln!("failed to create accounts: {:#}", err);
             ptr::null_mut()
         }
     }
@@ -3587,7 +3576,7 @@ pub unsafe extern "C" fn dc_accounts_get_next_event(
     if emitter.is_null() {
         return ptr::null_mut();
     }
-    let emitter = &*emitter;
+    let emitter = &mut *emitter;
 
     emitter
         .recv_sync()
