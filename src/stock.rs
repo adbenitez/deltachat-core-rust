@@ -119,9 +119,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "Archived chats"))]
     ArchivedChats = 40,
 
-    #[strum(props(fallback = "Starred messages"))]
-    StarredMsgs = 41,
-
     #[strum(props(fallback = "Autocrypt Setup Message"))]
     AcSetupMsgSubject = 42,
 
@@ -404,7 +401,7 @@ impl Context {
     pub async fn update_device_chats(&self) -> Result<(), Error> {
         // check for the LAST added device message - if it is present, we can skip message creation.
         // this is worthwhile as this function is typically called
-        // by the ui on every probram start or even on every opening of the chatlist.
+        // by the UI on every program start or even on every opening of the chatlist.
         if chat::was_device_msg_ever_added(&self, "core-welcome").await? {
             return Ok(());
         }

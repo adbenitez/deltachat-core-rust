@@ -431,7 +431,7 @@ int             dc_set_config_from_qr   (dc_context_t* context, const char* qr);
  * @param context The context object.
  * @return String which must be released using dc_str_unref() after usage.  Never returns NULL.
  */
-char*           dc_get_info                  (dc_context_t* context);
+char*           dc_get_info                  (const dc_context_t* context);
 
 
 /**
@@ -1523,20 +1523,6 @@ void            dc_marknoticed_contact       (dc_context_t* context, uint32_t co
  * @param msg_cnt The number of message IDs in msg_ids.
  */
 void            dc_markseen_msgs             (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
-
-
-/**
- * Star/unstar messages by setting the last parameter to 0 (unstar) or 1 (star).
- * Starred messages are collected in a virtual chat that can be shown using
- * dc_get_chat_msgs() using the chat_id DC_CHAT_ID_STARRED.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_ids An array of uint32_t message IDs defining the messages to star or unstar
- * @param msg_cnt The number of IDs in msg_ids
- * @param star 0=unstar the messages in msg_ids, 1=star them
- */
-void            dc_star_msgs                 (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt, int star);
 
 
 /**
@@ -2728,7 +2714,7 @@ dc_lot_t*        dc_chatlist_get_summary     (const dc_chatlist_t* chatlist, siz
  * @memberof dc_context_t
  * @param context The context object.
  * @param chat_id Chat to get a summary for.
- * @param msg_id Messasge to get a summary for.
+ * @param msg_id Message to get a summary for.
  * @return The summary as an dc_lot_t object, see dc_chatlist_get_summary() for details.
  *     Must be freed using dc_lot_unref().  NULL is never returned.
  */
@@ -2775,8 +2761,6 @@ char*            dc_chat_get_info_json       (dc_context_t* context, size_t chat
 
 #define         DC_CHAT_ID_DEADDROP          1 // virtual chat showing all messages belonging to chats flagged with chats.blocked=2
 #define         DC_CHAT_ID_TRASH             3 // messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
-#define         DC_CHAT_ID_MSGS_IN_CREATION  4 // a message is just in creation but not yet assigned to a chat (eg. we may need the message ID to set up blobs; this avoids unready message to be sent and shown)
-#define         DC_CHAT_ID_STARRED           5 // virtual chat showing all messages flagged with msgs.starred=2
 #define         DC_CHAT_ID_ARCHIVED_LINK     6 // only an indicator in a chatlist
 #define         DC_CHAT_ID_ALLDONE_HINT      7 // only an indicator in a chatlist
 #define         DC_CHAT_ID_LAST_SPECIAL      9 // larger chat IDs are "real" chats, their messages are "real" messages.
@@ -2803,7 +2787,6 @@ void            dc_chat_unref                (dc_chat_t* chat);
  *
  * Special IDs:
  * - DC_CHAT_ID_DEADDROP         (1) - Virtual chat containing messages which senders are not confirmed by the user.
- * - DC_CHAT_ID_STARRED          (5) - Virtual chat containing all starred messages-
  * - DC_CHAT_ID_ARCHIVED_LINK    (6) - A link at the end of the chatlist, if present the UI should show the button "Archived chats"-
  *
  * "Normal" chat IDs are larger than these special IDs (larger than DC_CHAT_ID_LAST_SPECIAL).
@@ -3437,21 +3420,6 @@ int             dc_msg_has_location           (const dc_msg_t* msg);
  * @return 1=message sent successfully, 0=message not yet sent or message is an incoming message.
  */
 int             dc_msg_is_sent                (const dc_msg_t* msg);
-
-
-/**
- * Check if a message is starred.  Starred messages are "favorites" marked by the user
- * with a "star" or something like that.  Starred messages can typically be shown
- * easily and are not deleted automatically.
- *
- * To star one or more messages, use dc_star_msgs(), to get a list of starred messages,
- * use dc_get_chat_msgs() using DC_CHAT_ID_STARRED as the chat_id.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return 1=message is starred, 0=message not starred.
- */
-int             dc_msg_is_starred             (const dc_msg_t* msg);
 
 
 /**
@@ -4365,7 +4333,7 @@ int dc_event_get_data2_int(dc_event_t* event);
  *
  * @memberof dc_event_t
  * @param event Event object as returned from dc_get_next_event().
- * @return "data2" as a string,
+ * @return "data2" as a string or NULL.
  *     the meaning depends on the event type associated with this event.
  *     Once you're done with the string, you have to unref it using dc_unref_str().
  */
@@ -4880,7 +4848,6 @@ void dc_event_unref(dc_event_t* event);
 #define DC_STR_CONTACT_NOT_VERIFIED       36
 #define DC_STR_CONTACT_SETUP_CHANGED      37
 #define DC_STR_ARCHIVEDCHATS              40
-#define DC_STR_STARREDMSGS                41
 #define DC_STR_AC_SETUP_MSG_SUBJECT       42
 #define DC_STR_AC_SETUP_MSG_BODY          43
 #define DC_STR_CANNOT_LOGIN               60

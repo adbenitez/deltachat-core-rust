@@ -218,7 +218,7 @@ pub unsafe extern "C" fn dc_set_config_from_qr(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_get_info(context: *mut dc_context_t) -> *mut libc::c_char {
+pub unsafe extern "C" fn dc_get_info(context: *const dc_context_t) -> *mut libc::c_char {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_get_info()");
         return "".strdup();
@@ -500,7 +500,7 @@ pub unsafe extern "C" fn dc_get_event_emitter(
 #[no_mangle]
 pub unsafe extern "C" fn dc_event_emitter_unref(emitter: *mut dc_event_emitter_t) {
     if emitter.is_null() {
-        eprintln!("ignoring careless call to dc_event_mitter_unref()");
+        eprintln!("ignoring careless call to dc_event_emitter_unref()");
         return;
     }
 
@@ -510,6 +510,7 @@ pub unsafe extern "C" fn dc_event_emitter_unref(emitter: *mut dc_event_emitter_t
 #[no_mangle]
 pub unsafe extern "C" fn dc_get_next_event(events: *mut dc_event_emitter_t) -> *mut dc_event_t {
     if events.is_null() {
+        eprintln!("ignoring careless call to dc_get_next_event()");
         return ptr::null_mut();
     }
     let events = &*events;
@@ -1461,23 +1462,6 @@ pub unsafe extern "C" fn dc_markseen_msgs(
     let ctx = &*context;
 
     block_on(message::markseen_msgs(&ctx, msg_ids));
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_star_msgs(
-    context: *mut dc_context_t,
-    msg_ids: *const u32,
-    msg_cnt: libc::c_int,
-    star: libc::c_int,
-) {
-    if context.is_null() || msg_ids.is_null() || msg_cnt <= 0 {
-        eprintln!("ignoring careless call to dc_star_msgs()");
-        return;
-    }
-    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
-    let ctx = &*context;
-
-    block_on(message::star_msgs(&ctx, msg_ids, star == 1));
 }
 
 #[no_mangle]
@@ -2814,16 +2798,6 @@ pub unsafe extern "C" fn dc_msg_is_sent(msg: *mut dc_msg_t) -> libc::c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_msg_is_starred(msg: *mut dc_msg_t) -> libc::c_int {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_is_starred()");
-        return 0;
-    }
-    let ffi_msg = &*msg;
-    ffi_msg.message.is_starred().into()
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_msg_is_forwarded(msg: *mut dc_msg_t) -> libc::c_int {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_is_forwarded()");
@@ -3574,6 +3548,7 @@ pub unsafe extern "C" fn dc_accounts_get_next_event(
     emitter: *mut dc_accounts_event_emitter_t,
 ) -> *mut dc_event_t {
     if emitter.is_null() {
+        eprintln!("ignoring careless call to dc_accounts_get_next_event()");
         return ptr::null_mut();
     }
     let emitter = &mut *emitter;
