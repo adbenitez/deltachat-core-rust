@@ -476,6 +476,21 @@ class TestOfflineChat:
         assert not res.is_ask_verifygroup()
         assert res.contact_id == 10
 
+    def test_quote(self, chat1):
+        """Offline quoting test"""
+        msg = Message.new_empty(chat1.account, "text")
+        msg.set_text("message")
+        assert msg.quoted_text is None
+
+        # Prepare message to assign it a Message-Id.
+        # Messages without Message-Id cannot be quoted.
+        msg = chat1.prepare_message(msg)
+
+        reply_msg = Message.new_empty(chat1.account, "text")
+        reply_msg.set_text("reply")
+        reply_msg.quote = msg
+        assert reply_msg.quoted_text == "message"
+
     def test_group_chat_many_members_add_remove(self, ac1, lp):
         lp.sec("ac1: creating group chat with 10 other members")
         chat = ac1.create_group_chat(name="title1")
@@ -1068,6 +1083,7 @@ class TestOnlineAccount:
         assert msg5.is_encrypted()
 
     def test_reply_encrypted(self, acfactory, lp):
+        """Test that replies to encrypted messages are encrypted."""
         ac1, ac2 = acfactory.get_two_online_accounts()
 
         lp.sec("ac1: create chat with ac2")
@@ -1095,26 +1111,26 @@ class TestOnlineAccount:
         print("ac2: e2ee_enabled={}".format(ac2.get_config("e2ee_enabled")))
         ac1.set_config("e2ee_enabled", "0")
 
-        # Set unprepared and unencrypted draft to test that it is not
-        # taken into account when determining whether last message is
-        # encrypted.
-        msg_draft = Message.new_empty(ac1, "text")
-        msg_draft.set_text("message2 -- should be encrypted")
-        chat.set_draft(msg_draft)
+        for quoted_msg in msg1, msg3:
+            # Save the draft with a quote.
+            # It should be encrypted if quoted message is encrypted.
+            msg_draft = Message.new_empty(ac1, "text")
+            msg_draft.set_text("message reply")
+            msg_draft.quote = quoted_msg
+            chat.set_draft(msg_draft)
 
-        # Get the draft, prepare and send it.
-        msg_draft = chat.get_draft()
-        msg_out = chat.prepare_message(msg_draft)
-        chat.send_prepared(msg_out)
+            # Get the draft, prepare and send it.
+            msg_draft = chat.get_draft()
+            msg_out = chat.prepare_message(msg_draft)
+            chat.send_prepared(msg_out)
 
-        chat.set_draft(None)
-        assert chat.get_draft() is None
+            chat.set_draft(None)
+            assert chat.get_draft() is None
 
-        lp.sec("wait for ac2 to receive message")
-        ev = ac2._evtracker.get_matching("DC_EVENT_INCOMING_MSG")
-        msg_in = ac2.get_message_by_id(ev.data2)
-        assert msg_in.text == "message2 -- should be encrypted"
-        assert msg_in.is_encrypted()
+            msg_in = ac2._evtracker.wait_next_incoming_message()
+            assert msg_in.text == "message reply"
+            assert msg_in.quoted_text == quoted_msg.text
+            assert msg_in.is_encrypted() == quoted_msg.is_encrypted()
 
     def test_saved_mime_on_received_message(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
@@ -1628,6 +1644,7 @@ class TestOnlineAccount:
         chat41 = ac4.create_chat(ac1)
         chat42 = ac4.create_chat(ac2)
         ac4.start_io()
+        ac4._evtracker.wait_all_initial_fetches()
 
         lp.sec("ac1: creating group chat with 2 other members")
         chat = ac1.create_group_chat("title", contacts=[ac2, ac3])
@@ -1867,6 +1884,82 @@ class TestOnlineAccount:
         else:
             # No renames should happen after explicit rename
             assert updated_name == "Renamed"
+
+    def test_group_quote(self, acfactory, lp):
+        """Test quoting in a group with a new member who have not seen the quoted message."""
+        ac1, ac2, ac3 = accounts = acfactory.get_many_online_accounts(3)
+        acfactory.introduce_each_other(accounts)
+        chat = ac1.create_group_chat(name="quote group")
+        chat.add_contact(ac2)
+
+        lp.sec("ac1: sending message")
+        out_msg = chat.send_text("hello")
+
+        lp.sec("ac2: receiving message")
+        msg = ac2._evtracker.wait_next_incoming_message()
+        assert msg.text == "hello"
+
+        chat.add_contact(ac3)
+        ac2._evtracker.wait_next_incoming_message()
+        ac3._evtracker.wait_next_incoming_message()
+
+        lp.sec("ac2: sending reply with a quote")
+        reply_msg = Message.new_empty(msg.chat.account, "text")
+        reply_msg.set_text("reply")
+        reply_msg.quote = msg
+        reply_msg = msg.chat.prepare_message(reply_msg)
+        assert reply_msg.quoted_text == "hello"
+        msg.chat.send_prepared(reply_msg)
+
+        lp.sec("ac3: receiving reply")
+        received_reply = ac3._evtracker.wait_next_incoming_message()
+        assert received_reply.text == "reply"
+        assert received_reply.quoted_text == "hello"
+        # ac3 was not in the group and has not received quoted message
+        assert received_reply.quote is None
+
+        lp.sec("ac1: receiving reply")
+        received_reply = ac1._evtracker.wait_next_incoming_message()
+        assert received_reply.text == "reply"
+        assert received_reply.quoted_text == "hello"
+        assert received_reply.quote.id == out_msg.id
+
+    @pytest.mark.parametrize("mvbox_move", [False, True])
+    def test_add_all_recipients_as_contacts(self, acfactory, lp, mvbox_move):
+        """Delta Chat reads the recipients from old emails sent by the user and adds them as contacts.
+        This way, we can already offer them some email addresses they can write to.
+
+        Also test that existing emails are fetched during onboarding.
+
+        Lastly, tests that bcc_self messages moved to the mvbox are marked as read."""
+        ac1 = acfactory.get_online_configuring_account(mvbox=mvbox_move, move=mvbox_move)
+        ac2 = acfactory.get_online_configuring_account()
+
+        acfactory.wait_configure_and_start_io()
+
+        chat = acfactory.get_accepted_chat(ac1, ac2)
+
+        lp.sec("send out message with bcc to ourselves")
+        if mvbox_move:
+            ac1.direct_imap.select_config_folder("mvbox")
+        ac1.direct_imap.idle_start()
+        ac1.set_config("bcc_self", "1")
+        chat.send_text("message text")
+
+        # now wait until the bcc_self message arrives
+        # Also test that bcc_self messages moved to the mvbox are marked as read.
+        assert ac1.direct_imap.idle_wait_for_seen()
+
+        ac1_clone = acfactory.clone_online_account(ac1)
+        ac1_clone._configtracker.wait_finish()
+        ac1_clone.start_io()
+
+        ac1_clone._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
+        ac2_addr = ac2.get_config("addr")
+        assert any(c.addr == ac2_addr for c in ac1_clone.get_contacts())
+
+        msg = ac1_clone._evtracker.wait_next_messages_changed()
+        assert msg.text == "message text"
 
 
 class TestGroupStressTests:
