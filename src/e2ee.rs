@@ -57,12 +57,9 @@ impl EncryptHelper {
     /// preferences, even if message copy is not sent to self.
     ///
     /// `e2ee_guaranteed` should be set to true for replies to encrypted messages (as required by
-    /// Autocrypt Level 1, version 1.1) and for messages sent in verified groups.
+    /// Autocrypt Level 1, version 1.1) and for messages sent in protected groups.
     ///
     /// Returns an error if `e2ee_guaranteed` is true, but one or more keys are missing.
-    ///
-    /// Always returns `false` if one of the peerstates does not support Autocrypt (is in "reset"
-    /// state) or does not have a known key.
     pub fn should_encrypt(
         &self,
         context: &Context,
@@ -84,7 +81,11 @@ impl EncryptHelper {
                     match peerstate.prefer_encrypt {
                         EncryptPreference::NoPreference => {}
                         EncryptPreference::Mutual => prefer_encrypt_count += 1,
-                        EncryptPreference::Reset => return Ok(false),
+                        EncryptPreference::Reset => {
+                            if !e2ee_guaranteed {
+                                return Ok(false);
+                            }
+                        }
                     };
                 }
                 None => {
@@ -509,5 +510,60 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         assert_eq!(peerstate_alice.prefer_encrypt, EncryptPreference::Reset);
 
         Ok(())
+    }
+
+    fn new_peerstates(
+        ctx: &Context,
+        prefer_encrypt: EncryptPreference,
+    ) -> Vec<(Option<Peerstate<'_>>, &str)> {
+        let addr = "bob@foo.bar";
+        let pub_key = bob_keypair().public;
+        let peerstate = Peerstate {
+            context: &ctx,
+            addr: addr.into(),
+            last_seen: 13,
+            last_seen_autocrypt: 14,
+            prefer_encrypt,
+            public_key: Some(pub_key.clone()),
+            public_key_fingerprint: Some(pub_key.fingerprint()),
+            gossip_key: Some(pub_key.clone()),
+            gossip_timestamp: 15,
+            gossip_key_fingerprint: Some(pub_key.fingerprint()),
+            verified_key: Some(pub_key.clone()),
+            verified_key_fingerprint: Some(pub_key.fingerprint()),
+            to_save: Some(ToSave::All),
+            fingerprint_changed: false,
+        };
+        let mut peerstates = Vec::new();
+        peerstates.push((Some(peerstate), addr));
+        peerstates
+    }
+
+    #[async_std::test]
+    async fn test_should_encrypt() {
+        let t = TestContext::new_alice().await;
+        let encrypt_helper = EncryptHelper::new(&t.ctx).await.unwrap();
+
+        // test with EncryptPreference::NoPreference:
+        // if e2ee_eguaranteed is unset, there is no encryption as not more than half of peers want encryption
+        let ps = new_peerstates(&t.ctx, EncryptPreference::NoPreference);
+        assert!(encrypt_helper.should_encrypt(&t.ctx, true, &ps).unwrap());
+        assert!(!encrypt_helper.should_encrypt(&t.ctx, false, &ps).unwrap());
+
+        // test with EncryptPreference::Reset
+        let ps = new_peerstates(&t.ctx, EncryptPreference::Reset);
+        assert!(encrypt_helper.should_encrypt(&t.ctx, true, &ps).unwrap());
+        assert!(!encrypt_helper.should_encrypt(&t.ctx, false, &ps).unwrap());
+
+        // test with EncryptPreference::Mutual (self is also Mutual)
+        let ps = new_peerstates(&t.ctx, EncryptPreference::Mutual);
+        assert!(encrypt_helper.should_encrypt(&t.ctx, true, &ps).unwrap());
+        assert!(encrypt_helper.should_encrypt(&t.ctx, false, &ps).unwrap());
+
+        // test with missing peerstate
+        let mut ps = Vec::new();
+        ps.push((None, "bob@foo.bar"));
+        assert!(encrypt_helper.should_encrypt(&t.ctx, true, &ps).is_err());
+        assert!(!encrypt_helper.should_encrypt(&t.ctx, false, &ps).unwrap());
     }
 }
