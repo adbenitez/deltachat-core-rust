@@ -717,7 +717,13 @@ async fn add_parts(
     // if a chat is protected, check additional properties
     if !chat_id.is_special() {
         let chat = Chat::load_from_db(context, *chat_id).await?;
-        if chat.is_protected() {
+        let new_status = match mime_parser.is_system_message {
+            SystemMessage::ChatProtectionEnabled => Some(ProtectionStatus::Protected),
+            SystemMessage::ChatProtectionDisabled => Some(ProtectionStatus::Unprotected),
+            _ => None,
+        };
+
+        if chat.is_protected() || new_status.is_some() {
             if let Err(err) =
                 check_verified_properties(context, mime_parser, from_id as u32, to_ids).await
             {
@@ -726,12 +732,16 @@ async fn add_parts(
                 mime_parser.repl_msg_by_error(s);
             } else {
                 // change chat protection only when verification check passes
-                if let Some(new_status) = match mime_parser.is_system_message {
-                    SystemMessage::ChatProtectionEnabled => Some(ProtectionStatus::Protected),
-                    SystemMessage::ChatProtectionDisabled => Some(ProtectionStatus::Unprotected),
-                    _ => None,
-                } {
-                    chat_id.inner_set_protection(context, new_status).await?;
+                if let Some(new_status) = new_status {
+                    if let Err(e) = chat_id.inner_set_protection(context, new_status).await {
+                        chat::add_info_msg(
+                            context,
+                            *chat_id,
+                            format!("Cannot set protection: {}", e),
+                        )
+                        .await;
+                        return Ok(()); // do not return an error as this would result in retrying the message
+                    }
                     set_better_msg(
                         mime_parser,
                         context.stock_protection_msg(new_status, from_id).await,
@@ -1244,13 +1254,16 @@ async fn create_or_lookup_group(
         chat_id_blocked = create_blocked;
         recreate_member_list = true;
 
-        if create_protected == ProtectionStatus::Protected {
-            // set from_id=0 as it is not clear that the sender of this random group message
-            // actually really has enabled chat-protection at some point.
-            chat_id
-                .add_protection_msg(context, ProtectionStatus::Protected, false, 0)
-                .await?;
-        }
+        // once, we have protected-chats explained in UI, we can uncomment the following lines.
+        // ("verified groups" did not add a message anyway)
+        //
+        //if create_protected == ProtectionStatus::Protected {
+        // set from_id=0 as it is not clear that the sender of this random group message
+        // actually really has enabled chat-protection at some point.
+        //chat_id
+        //    .add_protection_msg(context, ProtectionStatus::Protected, false, 0)
+        //    .await?;
+        //}
     }
 
     // again, check chat_id

@@ -460,6 +460,12 @@ impl ChatId {
                 msg.param.set(Param::File, blob.as_name());
             }
         }
+
+        let chat = Chat::load_from_db(context, self).await?;
+        if !chat.can_send() {
+            bail!("Can't set a draft: Can't send");
+        }
+
         context
             .sql
             .execute(
@@ -2034,7 +2040,9 @@ pub async fn create_group_chat(
     });
 
     if protect == ProtectionStatus::Protected {
-        chat_id.set_protection(context, protect).await?;
+        // this part is to stay compatible to verified groups,
+        // in some future, we will drop the "protect"-flag from create_group_chat()
+        chat_id.inner_set_protection(context, protect).await?;
     }
 
     Ok(chat_id)
