@@ -288,6 +288,28 @@ class TestOfflineChat:
         qr = chat.get_join_qr()
         assert ac2.check_qr(qr).is_ask_verifygroup
 
+    def test_removing_blocked_user_from_group(self, ac1, lp):
+        """
+        Test that blocked contact is not unblocked when removed from a group.
+        See https://github.com/deltachat/deltachat-core-rust/issues/2030
+        """
+        lp.sec("Create a group chat with a contact")
+        contact = ac1.create_contact("some1@example.org")
+        group = ac1.create_group_chat("title", contacts=[contact])
+        group.send_text("First group message")
+
+        lp.sec("ac1 blocks contact")
+        contact.block()
+        assert contact.is_blocked()
+
+        lp.sec("ac1 removes contact from their group")
+        group.remove_contact(contact)
+        assert contact.is_blocked()
+
+        lp.sec("ac1 adding blocked contact unblocks it")
+        group.add_contact(contact)
+        assert not contact.is_blocked()
+
     def test_get_set_profile_image_simple(self, ac1, data):
         chat = ac1.create_group_chat(name="title1")
         p = data.get_path("d.png")
@@ -938,6 +960,30 @@ class TestOnlineAccount:
         except queue.Empty:
             pass  # mark_seen_messages() has generated events before it returns
 
+    def test_reply_privately(self, acfactory):
+        ac1, ac2 = acfactory.get_two_online_accounts()
+
+        group1 = ac1.create_group_chat("group")
+        group1.add_contact(ac2)
+        group1.send_text("hello")
+
+        msg2 = ac2._evtracker.wait_next_messages_changed()
+        group2 = msg2.create_chat()
+        assert group2.get_name() == group1.get_name()
+
+        msg_reply = Message.new_empty(ac2, "text")
+        msg_reply.set_text("message reply")
+        msg_reply.quote = msg2
+
+        private_chat1 = ac1.create_chat(ac2)
+        private_chat2 = ac2.create_chat(ac1)
+        private_chat2.send_msg(msg_reply)
+
+        msg_reply1 = ac1._evtracker.wait_next_incoming_message()
+        assert msg_reply1.quoted_text == "hello"
+        assert not msg_reply1.chat.is_group()
+        assert msg_reply1.chat.id == private_chat1.id
+
     def test_mdn_asymetric(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts(move=True)
 
@@ -1521,7 +1567,7 @@ class TestOnlineAccount:
 
         lp.sec("ac1 blocks ac2")
         contact = ac1.create_contact(ac2)
-        contact.set_blocked()
+        contact.block()
         assert contact.is_blocked()
         ev = ac1._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
         assert ev.data1 == contact.id
@@ -1975,6 +2021,7 @@ class TestOnlineAccount:
         assert ac1.direct_imap.idle_wait_for_seen()
 
         ac1_clone = acfactory.clone_online_account(ac1)
+        ac1_clone.set_config("fetch_existing_msgs", "1")
         ac1_clone._configtracker.wait_finish()
         ac1_clone.start_io()
 
