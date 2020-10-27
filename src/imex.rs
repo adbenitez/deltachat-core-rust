@@ -31,6 +31,7 @@ use crate::param::*;
 use crate::pgp;
 use crate::sql::{self, Sql};
 use crate::stock::StockMessage;
+use ::pgp::types::KeyTrait;
 use async_tar::Archive;
 
 // Name of the database file in the backup.
@@ -78,11 +79,7 @@ pub enum ImexMode {
 ///
 /// Only one import-/export-progress can run at the same time.
 /// To cancel an import-/export-progress, drop the future returned by this function.
-pub async fn imex(
-    context: &Context,
-    what: ImexMode,
-    param1: Option<impl AsRef<Path>>,
-) -> Result<()> {
+pub async fn imex(context: &Context, what: ImexMode, param1: impl AsRef<Path>) -> Result<()> {
     let cancel = context.alloc_ongoing().await?;
 
     let res = async {
@@ -413,6 +410,8 @@ async fn set_self_key(
         },
     )
     .await?;
+
+    info!(context, "stored self key: {:?}", keypair.secret.key_id());
     Ok(())
 }
 
@@ -439,19 +438,11 @@ pub fn normalize_setup_code(s: &str) -> String {
     out
 }
 
-async fn imex_inner(
-    context: &Context,
-    what: ImexMode,
-    param: Option<impl AsRef<Path>>,
-) -> Result<()> {
-    ensure!(param.is_some(), "No Import/export dir/file given.");
-
-    info!(context, "Import/export process started.");
+async fn imex_inner(context: &Context, what: ImexMode, path: impl AsRef<Path>) -> Result<()> {
+    info!(context, "Import/export dir: {}", path.as_ref().display());
+    ensure!(context.sql.is_open().await, "Database not opened.");
     context.emit_event(EventType::ImexProgress(10));
 
-    ensure!(context.sql.is_open().await, "Database not opened.");
-
-    let path = param.ok_or_else(|| format_err!("Imex: Param was None"))?;
     if what == ImexMode::ExportBackup || what == ImexMode::ExportSelfKeys {
         // before we export anything, make sure the private key exists
         if e2ee::ensure_secret_key_exists(context).await.is_err() {
@@ -875,6 +866,12 @@ async fn import_self_keys(context: &Context, dir: impl AsRef<Path>) -> Result<()
                 continue;
             }
         }
+        info!(
+            context,
+            "considering key file: {}",
+            path_plus_name.display()
+        );
+
         match dc_read_file(context, &path_plus_name).await {
             Ok(buf) => {
                 let armored = std::string::String::from_utf8_lossy(&buf);
@@ -964,7 +961,7 @@ where
         let any_key = key as &dyn Any;
         let kind = if any_key.downcast_ref::<SignedPublicKey>().is_some() {
             "public"
-        } else if any_key.downcast_ref::<SignedPublicKey>().is_some() {
+        } else if any_key.downcast_ref::<SignedSecretKey>().is_some() {
             "private"
         } else {
             "unknown"
@@ -972,7 +969,12 @@ where
         let id = id.map_or("default".into(), |i| i.to_string());
         dir.as_ref().join(format!("{}-key-{}.asc", kind, &id))
     };
-    info!(context, "Exporting key {}", file_name.display());
+    info!(
+        context,
+        "Exporting key {:?} to {}",
+        key.key_id(),
+        file_name.display()
+    );
     dc_delete_file(context, &file_name).await;
 
     let content = key.to_asc(None).into_bytes();
@@ -1040,7 +1042,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_export_key_to_asc_file() {
+    async fn test_export_public_key_to_asc_file() {
         let context = TestContext::new().await;
         let key = alice_keypair().public;
         let blobdir = "$BLOBDIR";
@@ -1055,18 +1057,34 @@ mod tests {
     }
 
     #[async_std::test]
+    async fn test_export_private_key_to_asc_file() {
+        let context = TestContext::new().await;
+        let key = alice_keypair().secret;
+        let blobdir = "$BLOBDIR";
+        assert!(export_key_to_asc_file(&context.ctx, blobdir, None, &key)
+            .await
+            .is_ok());
+        let blobdir = context.ctx.get_blobdir().to_str().unwrap();
+        let filename = format!("{}/private-key-default.asc", blobdir);
+        let bytes = async_std::fs::read(&filename).await.unwrap();
+
+        assert_eq!(bytes, key.to_asc(None).into_bytes());
+    }
+
+    #[async_std::test]
     async fn test_export_and_import_key() {
         let context = TestContext::new().await;
         context.configure_alice().await;
-        let blobdir = "$BLOBDIR";
-        assert!(imex(&context.ctx, ImexMode::ExportSelfKeys, Some(blobdir))
-            .await
-            .is_ok());
-
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
-        assert!(imex(&context.ctx, ImexMode::ImportSelfKeys, Some(blobdir))
-            .await
-            .is_ok());
+        if let Err(err) = imex(&context.ctx, ImexMode::ExportSelfKeys, blobdir).await {
+            panic!("got error on export: {:?}", err);
+        }
+
+        let context2 = TestContext::new().await;
+        context2.configure_alice().await;
+        if let Err(err) = imex(&context2.ctx, ImexMode::ImportSelfKeys, blobdir).await {
+            panic!("got error on import: {:?}", err);
+        }
     }
 
     #[test]
