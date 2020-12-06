@@ -6,6 +6,7 @@ import queue
 import time
 from deltachat import const, Account
 from deltachat.message import Message
+from deltachat.tracker import ImexTracker
 from deltachat.hookspec import account_hookimpl
 from datetime import datetime, timedelta
 
@@ -1161,8 +1162,8 @@ class TestOnlineAccount:
         # Majority prefers encryption now
         assert msg5.is_encrypted()
 
-    def test_reply_encrypted(self, acfactory, lp):
-        """Test that replies to encrypted messages are encrypted."""
+    def test_quote_encrypted(self, acfactory, lp):
+        """Test that replies to encrypted messages with quotes are encrypted."""
         ac1, ac2 = acfactory.get_two_online_accounts()
 
         lp.sec("ac1: create chat with ac2")
@@ -1210,6 +1211,39 @@ class TestOnlineAccount:
             assert msg_in.text == "message reply"
             assert msg_in.quoted_text == quoted_msg.text
             assert msg_in.is_encrypted() == quoted_msg.is_encrypted()
+
+    def test_quote_attachment(self, tmpdir, acfactory, lp):
+        """Test that replies with an attachment and a quote are received correctly."""
+        ac1, ac2 = acfactory.get_two_online_accounts()
+
+        lp.sec("ac1 creates chat with ac2")
+        chat1 = ac1.create_chat(ac2)
+
+        lp.sec("ac1 sends text message to ac2")
+        chat1.send_text("hi")
+
+        lp.sec("ac2 receives contact request from ac1")
+        received_message = ac2._evtracker.wait_next_messages_changed()
+        assert received_message.text == "hi"
+
+        basename = "attachment.txt"
+        p = os.path.join(tmpdir.strpath, basename)
+        with open(p, "w") as f:
+            f.write("data to send")
+
+        lp.sec("ac2 sends a reply to ac1")
+        chat2 = received_message.create_chat()
+        reply = Message.new_empty(ac2, "file")
+        reply.set_text("message reply")
+        reply.set_file(p)
+        reply.quote = received_message
+        chat2.send_msg(reply)
+
+        lp.sec("ac1 receives a reply from ac2")
+        received_reply = ac1._evtracker.wait_next_incoming_message()
+        assert received_reply.text == "message reply"
+        assert received_reply.quoted_text == received_message.text
+        assert open(received_reply.filename).read() == "data to send"
 
     def test_saved_mime_on_received_message(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
@@ -1304,18 +1338,31 @@ class TestOnlineAccount:
         m = message_queue.get()
         assert m == msg_in
 
-    def test_import_export_online_all(self, acfactory, tmpdir, lp):
+    def test_import_export_online_all(self, acfactory, tmpdir, data, lp):
         ac1 = acfactory.get_one_online_account()
 
         lp.sec("create some chat content")
-        contact1 = ac1.create_contact("some1@example.org", name="some1")
-        contact1.create_chat().send_text("msg1")
+        chat1 = ac1.create_contact("some1@example.org", name="some1").create_chat()
+        chat1.send_text("msg1")
         assert len(ac1.get_contacts(query="some1")) == 1
+
+        original_image_path = data.get_path("d.png")
+        chat1.send_image(original_image_path)
+
         backupdir = tmpdir.mkdir("backup")
 
         lp.sec("export all to {}".format(backupdir))
-        path = ac1.export_all(backupdir.strpath)
-        assert os.path.exists(path)
+        with ac1.temp_plugin(ImexTracker()) as imex_tracker:
+            path = ac1.export_all(backupdir.strpath)
+            assert os.path.exists(path)
+
+            # check progress events for export
+            assert imex_tracker.wait_progress(1, progress_upper_limit=249)
+            assert imex_tracker.wait_progress(250, progress_upper_limit=499)
+            assert imex_tracker.wait_progress(500, progress_upper_limit=749)
+            assert imex_tracker.wait_progress(750, progress_upper_limit=999)
+            assert imex_tracker.wait_progress(1000)
+
         t = time.time()
 
         lp.sec("get fresh empty account")
@@ -1326,15 +1373,25 @@ class TestOnlineAccount:
         assert path2 == path
 
         lp.sec("import backup and check it's proper")
-        ac2.import_all(path)
+        with ac2.temp_plugin(ImexTracker()) as imex_tracker:
+            ac2.import_all(path)
+
+            # check progress events for import
+            assert imex_tracker.wait_progress(1, progress_upper_limit=249)
+            assert imex_tracker.wait_progress(500, progress_upper_limit=749)
+            assert imex_tracker.wait_progress(750, progress_upper_limit=999)
+            assert imex_tracker.wait_progress(1000)
+
         contacts = ac2.get_contacts(query="some1")
         assert len(contacts) == 1
         contact2 = contacts[0]
         assert contact2.addr == "some1@example.org"
         chat2 = contact2.create_chat()
         messages = chat2.get_messages()
-        assert len(messages) == 1
+        assert len(messages) == 2
         assert messages[0].text == "msg1"
+        assert messages[1].filemime == "image/png"
+        assert os.stat(messages[1].filename).st_size == os.stat(original_image_path).st_size
 
         # wait until a second passed since last backup
         # because get_latest_backupfile() shall return the latest backup

@@ -11,6 +11,7 @@ use crate::constants::*;
 use crate::contact::*;
 use crate::context::*;
 use crate::dc_tools::*;
+use crate::ephemeral::Timer as EphemeralTimer;
 use crate::error::{ensure, Error};
 use crate::events::EventType;
 use crate::job::{self, Action};
@@ -255,7 +256,7 @@ pub struct Message {
     pub(crate) timestamp_sort: i64,
     pub(crate) timestamp_sent: i64,
     pub(crate) timestamp_rcvd: i64,
-    pub(crate) ephemeral_timer: u32,
+    pub(crate) ephemeral_timer: EphemeralTimer,
     pub(crate) ephemeral_timestamp: i64,
     pub(crate) text: Option<String>,
     pub(crate) rfc724_mid: String,
@@ -523,7 +524,7 @@ impl Message {
         self.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() != 0
     }
 
-    pub fn get_ephemeral_timer(&self) -> u32 {
+    pub fn get_ephemeral_timer(&self) -> EphemeralTimer {
         self.ephemeral_timer
     }
 
@@ -787,11 +788,8 @@ impl Message {
     pub async fn quoted_message(&self, context: &Context) -> Result<Option<Message>, Error> {
         if self.param.get(Param::Quote).is_some() {
             if let Some(in_reply_to) = &self.in_reply_to {
-                let rfc724_mid = in_reply_to.trim_start_matches('<').trim_end_matches('>');
-                if !rfc724_mid.is_empty() {
-                    if let Some((_, _, msg_id)) = rfc724_mid_exists(context, rfc724_mid).await? {
-                        return Ok(Some(Message::load_from_db(context, msg_id).await?));
-                    }
+                if let Some((_, _, msg_id)) = rfc724_mid_exists(context, in_reply_to).await? {
+                    return Ok(Some(Message::load_from_db(context, msg_id).await?));
                 }
             }
         }
@@ -1068,8 +1066,8 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> String {
         ret += "\n";
     }
 
-    if msg.ephemeral_timer != 0 {
-        ret += &format!("Ephemeral timer: {}\n", msg.ephemeral_timer);
+    if let EphemeralTimer::Enabled { duration } = msg.ephemeral_timer {
+        ret += &format!("Ephemeral timer: {}\n", duration);
     }
 
     if msg.ephemeral_timestamp != 0 {
@@ -1818,6 +1816,7 @@ pub(crate) async fn rfc724_mid_exists(
     context: &Context,
     rfc724_mid: &str,
 ) -> Result<Option<(String, u32, MsgId)>, Error> {
+    let rfc724_mid = rfc724_mid.trim_start_matches('<').trim_end_matches('>');
     if rfc724_mid.is_empty() {
         warn!(context, "Empty rfc724_mid passed to rfc724_mid_exists");
         return Ok(None);
