@@ -488,13 +488,13 @@ async fn add_parts(
             }
         }
 
-        // if chat_id.is_unset() {
-        //     // check if the message belongs to a mailing list
-        //     if mime_parser.is_mailinglist_message() {
-        //         *chat_id = ChatId::new(DC_CHAT_ID_TRASH);
-        //         info!(context, "Message belongs to a mailing list (TRASH)");
-        //     }
-        // }
+        if chat_id.is_unset() {
+            // check if the message belongs to a mailing list
+            if mime_parser.is_mailinglist_message() {
+                *chat_id = ChatId::new(DC_CHAT_ID_TRASH);
+                info!(context, "Message belongs to a mailing list (TRASH)");
+            }
+        }
 
         if chat_id.is_unset() {
             // try to create a normal chat
@@ -1202,23 +1202,23 @@ async fn create_or_lookup_group(
     }
 
     // check if the group does not exist but should be created
-    // let group_explicitly_left = chat::is_group_explicitly_left(context, &grpid)
-    //     .await
-    //     .unwrap_or_default();
+    let group_explicitly_left = chat::is_group_explicitly_left(context, &grpid)
+        .await
+        .unwrap_or_default();
     let self_addr = context
         .get_config(Config::ConfiguredAddr)
         .await
         .unwrap_or_default();
 
     if chat_id.is_unset()
-            // && !mime_parser.is_mailinglist_message()
+            && !mime_parser.is_mailinglist_message()
             && !grpid.is_empty()
             && grpname.is_some()
             // otherwise, a pending "quit" message may pop up
             && removed_id == 0
             // re-create explicitly left groups only if ourself is re-added
-            // && (!group_explicitly_left
-            //     || X_MrAddToGrp.is_some() && addr_cmp(&self_addr, X_MrAddToGrp.as_ref().unwrap()))
+            && (!group_explicitly_left
+                || X_MrAddToGrp.is_some() && addr_cmp(&self_addr, X_MrAddToGrp.as_ref().unwrap()))
     {
         // group does not exist but should be created
         let create_protected = if mime_parser.get(HeaderDef::ChatVerified).is_some() {
@@ -1415,15 +1415,15 @@ async fn create_or_lookup_adhoc_group(
     from_id: u32,
     to_ids: &ContactIds,
 ) -> Result<(ChatId, Blocked)> {
-    // if mime_parser.is_mailinglist_message() {
-    //     // XXX we could parse List-* headers and actually create and
-    //     // manage a mailing list group, eventually
-    //     info!(
-    //         context,
-    //         "not creating ad-hoc group for mailing list message"
-    //     );
-    //     return Ok((ChatId::new(0), Blocked::Not));
-    // }
+    if mime_parser.is_mailinglist_message() {
+        // XXX we could parse List-* headers and actually create and
+        // manage a mailing list group, eventually
+        info!(
+            context,
+            "not creating ad-hoc group for mailing list message"
+        );
+        return Ok((ChatId::new(0), Blocked::Not));
+    }
 
     // if we're here, no grpid was found, check if there is an existing
     // ad-hoc group matching the to-list or if we should and can create one
