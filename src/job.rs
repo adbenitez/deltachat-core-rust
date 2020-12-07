@@ -852,7 +852,6 @@ pub async fn send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<Job
     msg.try_calc_and_set_dimensions(context).await.ok();
 
     if ! context.get_config_bool(Config::E2eeEnabled).await {
-	msg.param.set_int(Param::GuaranteeE2ee, 0);
 	msg.param.set_int(Param::ForcePlaintext, 2);
 	msg.update_param(context).await;
     }
