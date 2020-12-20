@@ -115,7 +115,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                 .await?;
 
             if !msg.is_system_message() && context.get_config_bool(Config::MdnsEnabled).await {
-                req_mdn = true;
+                req_mdn = chat.typ != Chattype::Group;
             }
         }
         let (in_reply_to, references) = context
