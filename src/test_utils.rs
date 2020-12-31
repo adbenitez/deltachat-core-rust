@@ -2,24 +2,27 @@
 //!
 //! This module is only compiled for test runs.
 
-use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{ops::Deref, str::FromStr};
 
 use async_std::path::PathBuf;
 use async_std::sync::RwLock;
 use tempfile::{tempdir, TempDir};
 
-use crate::chat;
-use crate::chat::{ChatId, ChatItem};
-use crate::config::Config;
-use crate::context::Context;
-use crate::dc_receive_imf::dc_receive_imf;
-use crate::dc_tools::EmailAddress;
 use crate::job::Action;
 use crate::key::{self, DcKey};
 use crate::message::{update_msg_state, Message, MessageState, MsgId};
 use crate::mimeparser::MimeMessage;
 use crate::param::{Param, Params};
+use crate::{chat, contact::Contact};
+use crate::{
+    chat::{Chat, ChatId, ChatItem},
+    contact::Origin,
+};
+use crate::{config::Config, constants::DC_CONTACT_ID_SELF};
+use crate::{constants::Viewtype, context::Context};
+use crate::{constants::DC_MSG_ID_DAYMARKER, dc_tools::EmailAddress};
+use crate::{constants::DC_MSG_ID_MARKER1, dc_receive_imf::dc_receive_imf};
 
 /// A Context and temporary directory.
 ///
@@ -74,7 +77,7 @@ impl TestContext {
         let t = Self::new().await;
         let keypair = bob_keypair();
         t.configure_addr(&keypair.addr.to_string()).await;
-        key::store_self_keypair(&t.ctx, &keypair, key::KeyPairUse::Default)
+        key::store_self_keypair(&t, &keypair, key::KeyPairUse::Default)
             .await
             .expect("Failed to save Bob's key");
         t
@@ -126,7 +129,7 @@ impl TestContext {
                     SELECT id, foreign_id, param
                       FROM jobs
                      WHERE action=?
-                  ORDER BY desired_timestamp;
+                  ORDER BY desired_timestamp DESC;
                 "#,
                     paramsv![Action::SendMsgToSmtp],
                     |row| {
@@ -160,7 +163,11 @@ impl TestContext {
             .await
             .expect("failed to remove job");
         update_msg_state(&self.ctx, id, MessageState::OutDelivered).await;
-        SentMessage { params, blob_path }
+        SentMessage {
+            params,
+            blob_path,
+            sender_msg_id: id,
+        }
     }
 
     /// Parse a message.
@@ -199,6 +206,96 @@ impl TestContext {
         };
         Message::load_from_db(&self.ctx, *msg_id).await.unwrap()
     }
+
+    pub async fn create_chat(&self, other: &TestContext) -> Chat {
+        let (contact_id, _modified) = Contact::add_or_lookup(
+            self,
+            other
+                .ctx
+                .get_config(Config::Displayname)
+                .await
+                .unwrap_or_default(),
+            other.ctx.get_config(Config::ConfiguredAddr).await.unwrap(),
+            Origin::ManuallyCreated,
+        )
+        .await
+        .unwrap();
+
+        let chat_id = chat::create_by_contact_id(self, contact_id).await.unwrap();
+        Chat::load_from_db(self, chat_id).await.unwrap()
+    }
+
+    pub async fn chat_with_contact(&self, name: &str, addr: &str) -> Chat {
+        let contact = Contact::create(self, name, addr)
+            .await
+            .expect("failed to create contact");
+        let chat_id = chat::create_by_contact_id(self, contact).await.unwrap();
+        Chat::load_from_db(self, chat_id).await.unwrap()
+    }
+
+    pub async fn get_self_chat(&self) -> Chat {
+        let chat_id = chat::create_by_contact_id(self, DC_CONTACT_ID_SELF)
+            .await
+            .unwrap();
+        Chat::load_from_db(self, chat_id).await.unwrap()
+    }
+
+    /// Sends out the text message. If the other side shall receive it, you have to call `recv_msg()` with the returned `SentMessage`.
+    pub async fn send_text(&self, chat_id: ChatId, txt: &str) -> SentMessage {
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some(txt.to_string()));
+        chat::prepare_msg(&self, chat_id, &mut msg).await.unwrap();
+        chat::send_msg(&self, chat_id, &mut msg).await.unwrap();
+        self.pop_sent_msg().await
+    }
+
+    /// You can use this to debug your test by printing a chat structure
+    // This code is mainly the same as `log_msglist` in `cmdline.rs`, so one day, we could merge them to a public function in the `deltachat` crate.
+    #[allow(dead_code)]
+    pub async fn print_chat(&self, chat: &Chat) {
+        let msglist = chat::get_chat_msgs(&self, chat.get_id(), 0x1, None).await;
+        let msglist: Vec<MsgId> = msglist
+            .into_iter()
+            .map(|x| match x {
+                ChatItem::Message { msg_id } => msg_id,
+                ChatItem::Marker1 => MsgId::new(DC_MSG_ID_MARKER1),
+                ChatItem::DayMarker { .. } => MsgId::new(DC_MSG_ID_DAYMARKER),
+            })
+            .collect();
+
+        let mut lines_out = 0;
+        for msg_id in msglist {
+            if msg_id == MsgId::new(DC_MSG_ID_DAYMARKER) {
+                println!(
+                "--------------------------------------------------------------------------------"
+            );
+
+                lines_out += 1
+            } else if !msg_id.is_special() {
+                if lines_out == 0 {
+                    println!(
+                    "--------------------------------------------------------------------------------",
+                );
+                    lines_out += 1
+                }
+                let msg = Message::load_from_db(&self, msg_id).await.unwrap();
+                log_msg(self, "", &msg).await;
+            }
+        }
+        if lines_out > 0 {
+            println!(
+                "--------------------------------------------------------------------------------"
+            );
+        }
+    }
+}
+
+impl Deref for TestContext {
+    type Target = Context;
+
+    fn deref(&self) -> &Context {
+        &self.ctx
+    }
 }
 
 /// A raw message as it was scheduled to be sent.
@@ -209,6 +306,7 @@ impl TestContext {
 pub struct SentMessage {
     params: Params,
     blob_path: PathBuf,
+    pub sender_msg_id: MsgId,
 }
 
 impl SentMessage {
@@ -264,4 +362,57 @@ pub(crate) fn bob_keypair() -> key::KeyPair {
         public,
         secret,
     }
+}
+
+async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
+    let contact = Contact::get_by_id(context, msg.get_from_id())
+        .await
+        .expect("invalid contact");
+
+    let contact_name = contact.get_name();
+    let contact_id = contact.get_id();
+
+    let statestr = match msg.get_state() {
+        MessageState::OutPending => " o",
+        MessageState::OutDelivered => " √",
+        MessageState::OutMdnRcvd => " √√",
+        MessageState::OutFailed => " !!",
+        _ => "",
+    };
+    let msgtext = msg.get_text();
+    println!(
+        "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}{}",
+        prefix.as_ref(),
+        msg.get_id(),
+        if msg.get_showpadlock() { "🔒" } else { "" },
+        if msg.has_location() { "📍" } else { "" },
+        &contact_name,
+        contact_id,
+        msgtext.unwrap_or_default(),
+        if msg.get_from_id() == 1 as libc::c_uint {
+            ""
+        } else if msg.get_state() == MessageState::InSeen {
+            "[SEEN]"
+        } else if msg.get_state() == MessageState::InNoticed {
+            "[NOTICED]"
+        } else {
+            "[FRESH]"
+        },
+        if msg.is_info() { "[INFO]" } else { "" },
+        if msg.get_viewtype() == Viewtype::VideochatInvitation {
+            format!(
+                "[VIDEOCHAT-INVITATION: {}, type={}]",
+                msg.get_videochat_url().unwrap_or_default(),
+                msg.get_videochat_type().unwrap_or_default()
+            )
+        } else {
+            "".to_string()
+        },
+        if msg.is_forwarded() {
+            "[FORWARDED]"
+        } else {
+            ""
+        },
+        statestr,
+    );
 }

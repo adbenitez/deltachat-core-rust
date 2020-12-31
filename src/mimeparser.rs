@@ -225,7 +225,7 @@ impl MimeMessage {
             failure_report: None,
         };
         parser.parse_mime_recursive(context, &mail).await?;
-        parser.maybe_remove_bad_parts().await;
+        parser.maybe_remove_bad_parts();
         parser.heuristically_parse_ndn(context).await;
         parser.parse_headers(context)?;
 
@@ -394,7 +394,7 @@ impl MimeMessage {
 
                 if !subj.is_empty() {
                     for part in self.parts.iter_mut() {
-                        if part.typ == Viewtype::Text {
+                        if !part.msg.is_empty() {
                             part.msg = format!("{} – {}", subj, part.msg);
                             break;
                         }
@@ -767,7 +767,7 @@ impl MimeMessage {
 
                         if !simplified_txt.is_empty() || simplified_quote.is_some() {
                             let mut part = Part::default();
-                            part.dehtlm_failed = dehtml_failed;
+                            part.dehtml_failed = dehtml_failed;
                             part.typ = Viewtype::Text;
                             part.mimetype = Some(mime_type);
                             part.msg = simplified_txt;
@@ -1010,13 +1010,13 @@ impl MimeMessage {
         Ok(None)
     }
 
-    async fn maybe_remove_bad_parts(&mut self) {
-        let good_parts = self.parts.iter().filter(|p| !p.dehtlm_failed).count();
+    fn maybe_remove_bad_parts(&mut self) {
+        let good_parts = self.parts.iter().filter(|p| !p.dehtml_failed).count();
         if good_parts == 0 {
             // We have no good part but show at least one bad part in order to show anything at all
             self.parts.truncate(1);
         } else if good_parts < self.parts.len() {
-            self.parts.retain(|p| !p.dehtlm_failed);
+            self.parts.retain(|p| !p.dehtml_failed);
         }
     }
 
@@ -1223,7 +1223,7 @@ pub struct Part {
     pub param: Params,
     org_filename: Option<String>,
     pub error: Option<String>,
-    dehtlm_failed: bool,
+    dehtml_failed: bool,
 }
 
 /// return mimetype and viewtype for a parsed mail
@@ -1420,7 +1420,14 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::test_utils::*;
+    use crate::{
+        chatlist::Chatlist,
+        config::Config,
+        constants::Blocked,
+        dc_receive_imf::dc_receive_imf,
+        message::{Message, MessageState, MessengerMessage},
+        test_utils::*,
+    };
     use mailparse::ParsedMail;
 
     impl AvatarAction {
@@ -1493,8 +1500,8 @@ mod tests {
 
     fn load_mail_with_attachment<'a>(t: &'a TestContext, raw: &'a [u8]) -> ParsedMail<'a> {
         let mail = mailparse::parse_mail(raw).unwrap();
-        assert!(get_attachment_filename(&t.ctx, &mail).unwrap().is_none());
-        assert!(get_attachment_filename(&t.ctx, &mail.subparts[0])
+        assert!(get_attachment_filename(&t, &mail).unwrap().is_none());
+        assert!(get_attachment_filename(&t, &mail.subparts[0])
             .unwrap()
             .is_none());
         mail
@@ -1507,7 +1514,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_simple.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("test.html".to_string()))
     }
 
@@ -1518,7 +1525,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_encoded_words.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Maßnahmen Okt. 2020.html".to_string()))
     }
 
@@ -1529,7 +1536,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_encoded_words_binary.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some(" § 165 Abs".to_string()))
     }
 
@@ -1540,7 +1547,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_encoded_words_windows1251.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("file Что нового 2020.pdf".to_string()))
     }
 
@@ -1552,7 +1559,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_encoded_words_cont.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Maßn'ah'men Okt. 2020.html".to_string()))
     }
 
@@ -1563,7 +1570,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_encoded_words_bad_delimiter.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         // not decoded as a space is missing after encoded-words part
         assert_eq!(filename, Some("=?utf-8?q?foo?=.bar".to_string()))
     }
@@ -1575,7 +1582,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_apostrophed.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Maßnahmen Okt. 2021.html".to_string()))
     }
 
@@ -1586,7 +1593,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_apostrophed_cont.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Maßnahmen März 2022.html".to_string()))
     }
 
@@ -1597,7 +1604,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_apostrophed_windows1251.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("программирование.HTM".to_string()))
     }
 
@@ -1608,7 +1615,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_apostrophed_cp1252.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Auftragsbestätigung.pdf".to_string()))
     }
 
@@ -1619,7 +1626,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_apostrophed_invalid.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("somedäüta.html.zip".to_string()))
     }
 
@@ -1631,7 +1638,7 @@ mod tests {
             &t,
             include_bytes!("../test-data/message/attach_filename_combined.eml"),
         );
-        let filename = get_attachment_filename(&t.ctx, &mail.subparts[1]).unwrap();
+        let filename = get_attachment_filename(&t, &mail.subparts[1]).unwrap();
         assert_eq!(filename, Some("Maßnahmen Okt. 2020.html".to_string()))
     }
 
@@ -1764,26 +1771,26 @@ mod tests {
         let t = TestContext::new().await;
 
         let raw = include_bytes!("../test-data/message/mail_attach_txt.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
         assert_eq!(mimeparser.user_avatar, None);
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar_deleted.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert_eq!(mimeparser.user_avatar, Some(AvatarAction::Delete));
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
@@ -1793,9 +1800,7 @@ mod tests {
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
         let raw = String::from_utf8_lossy(raw).to_string();
         let raw = raw.replace("Chat-User-Avatar:", "Xhat-Xser-Xvatar:");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw.as_bytes())
-            .await
-            .unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, raw.as_bytes()).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Image);
         assert_eq!(mimeparser.user_avatar, None);
@@ -1807,7 +1812,7 @@ mod tests {
         let t = TestContext::new().await;
 
         let raw = include_bytes!("../test-data/message/videochat_invitation.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::VideochatInvitation);
         assert_eq!(
@@ -2087,7 +2092,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::File);
-        assert_eq!(message.parts[0].msg, "Hello!");
+        assert_eq!(message.parts[0].msg, "Mail with inline attachment – Hello!");
     }
 
     #[async_std::test]
@@ -2121,7 +2126,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 ------=_Part_25_46172632.1581201680436--
 "#;
 
-        let message = MimeMessage::from_bytes(&t.ctx, &raw[..]).await.unwrap();
+        let message = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::File);
@@ -2130,7 +2135,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
         // Make sure the file is there even though the html is wrong:
         let param = &message.parts[0].param;
         let blob: BlobObject = param
-            .get_blob(Param::File, &t.ctx, false)
+            .get_blob(Param::File, &t, false)
             .await
             .unwrap()
             .unwrap();
@@ -2182,7 +2187,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::Image);
-        assert_eq!(message.parts[0].msg, "Test");
+        assert_eq!(message.parts[0].msg, "example – Test");
     }
 
     #[async_std::test]
@@ -2254,7 +2259,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::Image);
-        assert_eq!(message.parts[0].msg, "Test");
+        assert_eq!(message.parts[0].msg, "Test subject – Test");
     }
 
     // Outlook specifies filename in the "name" attribute of Content-Type
@@ -2328,7 +2333,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::Image);
-        assert_eq!(message.parts[0].msg, "Test");
+        assert_eq!(message.parts[0].msg, "Delta Chat is great stuff! – Test");
     }
 
     #[test]
@@ -2518,8 +2523,43 @@ On 2020-10-25, Bob wrote:
     async fn test_quote_div() {
         let t = TestContext::new().await;
         let raw = include_bytes!("../test-data/message/gmx-quote.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, raw).await.unwrap();
         assert_eq!(mimeparser.parts[0].msg, "YIPPEEEEEE\n\nMulti-line");
         assert_eq!(mimeparser.parts[0].param.get(Param::Quote).unwrap(), "Now?");
+    }
+
+    #[async_std::test]
+    async fn test_add_subj_to_multimedia_msg() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+        dc_receive_imf(
+            &t.ctx,
+            include_bytes!("../test-data/message/subj_with_multimedia_msg.eml"),
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
+        let msg_id = chats.get_msg_id(0).unwrap();
+        let msg = Message::load_from_db(&t.ctx, msg_id).await.unwrap();
+
+        assert_eq!(
+            msg.text.as_ref().unwrap(),
+            "subj with important info – body text"
+        );
+        assert_eq!(msg.viewtype, Viewtype::Image);
+        assert_eq!(msg.error(), None);
+        assert_eq!(msg.is_dc_message, MessengerMessage::No);
+        assert_eq!(msg.chat_blocked, Blocked::Deaddrop);
+        assert_eq!(msg.state, MessageState::InFresh);
+        assert_eq!(msg.get_filebytes(&t).await, 2115);
+        assert!(msg.get_file(&t).is_some());
+        assert_eq!(msg.get_filename().unwrap(), "avatar64x64.png");
+        assert_eq!(msg.get_width(), 64);
+        assert_eq!(msg.get_height(), 64);
+        assert_eq!(msg.get_filemime().unwrap(), "image/png");
     }
 }

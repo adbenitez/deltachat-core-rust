@@ -1223,6 +1223,18 @@ pub async fn add(context: &Context, job: Job) {
     }
 }
 
+async fn load_housekeeping_job(context: &Context) -> Option<Job> {
+    let last_time = context.get_config_i64(Config::LastHousekeeping).await;
+
+    let next_time = last_time + (60 * 60 * 24);
+    if next_time <= time() {
+        kill_action(context, Action::Housekeeping).await;
+        Some(Job::new(Action::Housekeeping, 0, Params::new(), 0))
+    } else {
+        None
+    }
+}
+
 /// Load jobs from the database.
 ///
 /// Load jobs for this "[Thread]", i.e. either load SMTP jobs or load
@@ -1339,8 +1351,10 @@ LIMIT 1;
                 } else {
                     Some(job)
                 }
+            } else if let Some(job) = load_imap_deletion_job(context).await.unwrap_or_default() {
+                Some(job)
             } else {
-                load_imap_deletion_job(context).await.unwrap_or_default()
+                load_housekeeping_job(context).await
             }
         }
         Thread::Smtp => job,
@@ -1380,18 +1394,19 @@ mod tests {
         // fails to load from the database instead of failing to load
         // all jobs.
         let t = TestContext::new().await;
-        insert_job(&t.ctx, -1).await; // This can not be loaded into Job struct.
+        insert_job(&t, -1).await; // This can not be loaded into Job struct.
         let jobs = load_next(
-            &t.ctx,
+            &t,
             Thread::from(Action::MoveMsg),
             &InterruptInfo::new(false, None),
         )
         .await;
-        assert!(jobs.is_none());
+        // The housekeeping job should be loaded as we didn't run housekeeping in the last day:
+        assert!(jobs.unwrap().action == Action::Housekeeping);
 
-        insert_job(&t.ctx, 1).await;
+        insert_job(&t, 1).await;
         let jobs = load_next(
-            &t.ctx,
+            &t,
             Thread::from(Action::MoveMsg),
             &InterruptInfo::new(false, None),
         )
@@ -1403,10 +1418,10 @@ mod tests {
     async fn test_load_next_job_one() {
         let t = TestContext::new().await;
 
-        insert_job(&t.ctx, 1).await;
+        insert_job(&t, 1).await;
 
         let jobs = load_next(
-            &t.ctx,
+            &t,
             Thread::from(Action::MoveMsg),
             &InterruptInfo::new(false, None),
         )
