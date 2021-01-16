@@ -7,7 +7,7 @@ use crate::blob::BlobObject;
 use crate::chat::ChatId;
 use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::{dc_get_abs_path, improve_single_line_input};
 use crate::events::EventType;
 use crate::job;
 use crate::message::MsgId;
@@ -116,6 +116,8 @@ pub enum Config {
     ConfiguredInboxFolder,
     ConfiguredMvboxFolder,
     ConfiguredSentboxFolder,
+    ConfiguredSpamFolder,
+    ConfiguredTimestamp,
     ConfiguredProvider,
     Configured,
 
@@ -140,6 +142,10 @@ pub enum Config {
 
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
+
+    /// To how many seconds to debounce scan_all_folders. Used mainly in tests, to disable debouncing completely.
+    #[strum(props(default = "60"))]
+    ScanAllFoldersDebounceSecs,
 }
 
 impl Context {
@@ -180,6 +186,13 @@ impl Context {
     }
 
     pub async fn get_config_i64(&self, key: Config) -> i64 {
+        self.get_config(key)
+            .await
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    }
+
+    pub async fn get_config_u64(&self, key: Config) -> u64 {
         self.get_config(key)
             .await
             .and_then(|s| s.parse().ok())
@@ -263,16 +276,6 @@ impl Context {
                 job::schedule_resync(self).await;
                 ret
             }
-            Config::InboxWatch => {
-                if self.get_config(Config::InboxWatch).await.as_deref() != value {
-                    // If Inbox-watch is disabled and enabled again, do not fetch emails from in between.
-                    // this avoids unexpected mass-downloads and -deletions (if delete_server_after is set)
-                    if let Some(inbox) = self.get_config(Config::ConfiguredInboxFolder).await {
-                        crate::imap::set_config_last_seen_uid(self, inbox, 0, 0).await;
-                    }
-                }
-                self.sql.set_raw_config(self, key, value).await
-            }
             _ => self.sql.set_raw_config(self, key, value).await,
         }
     }
@@ -298,7 +301,7 @@ mod tests {
 
     use crate::constants;
     use crate::constants::BALANCED_AVATAR_SIZE;
-    use crate::test_utils::*;
+    use crate::test_utils::TestContext;
     use image::GenericImageView;
     use num_traits::FromPrimitive;
     use std::fs::File;

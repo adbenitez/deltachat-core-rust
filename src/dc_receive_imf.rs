@@ -6,19 +6,24 @@ use mailparse::SingleInfo;
 
 use crate::chat::{self, Chat, ChatId, ProtectionStatus};
 use crate::config::Config;
-use crate::constants::*;
-use crate::contact::*;
+use crate::constants::{
+    Blocked, Chattype, ShowEmails, Viewtype, DC_CHAT_ID_TRASH, DC_CONTACT_ID_LAST_SPECIAL,
+    DC_CONTACT_ID_SELF,
+};
+use crate::contact::{addr_cmp, normalize_name, Contact, Origin, VerifiedStatus};
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::{
+    dc_create_smeared_timestamp, dc_extract_grpid_from_rfc724_mid, dc_smeared_time, time,
+};
 use crate::ephemeral::{stock_ephemeral_timer_changed, Timer as EphemeralTimer};
 use crate::error::{bail, ensure, format_err, Result};
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::job::{self, Action};
 use crate::message::{self, rfc724_mid_exists, Message, MessageState, MessengerMessage, MsgId};
-use crate::mimeparser::*;
-use crate::param::*;
-use crate::peerstate::*;
+use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
+use crate::param::{Param, Params};
+use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
 use crate::stock::StockMessage;
 use crate::{contact, location};
@@ -246,6 +251,7 @@ pub(crate) async fn dc_receive_imf_inner(
             .needs_move(context, server_folder.as_ref())
             .await
             .unwrap_or_default()
+            .is_some()
         {
             // Move message if we don't delete it immediately.
             job::add(
@@ -399,6 +405,14 @@ async fn add_parts(
             ShowEmails::AcceptedContacts => allow_creation = false,
             ShowEmails::All => {}
         }
+    }
+
+    if !context.is_sentbox(&server_folder).await && mime_parser.get(HeaderDef::Received).is_none() {
+        // Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them
+        // So: If there is no Received header AND it's not in the sentbox, then ignore the email.
+        info!(context, "Email is probably just a draft (TRASH)");
+        *chat_id = ChatId::new(DC_CHAT_ID_TRASH);
+        allow_creation = false;
     }
 
     // check if the message introduces a new chat:
@@ -802,11 +816,24 @@ async fn add_parts(
     let mut parts = std::mem::replace(&mut mime_parser.parts, Vec::new());
     let server_folder = server_folder.as_ref().to_string();
     let is_system_message = mime_parser.is_system_message;
-    let mime_headers = if save_mime_headers {
+
+    // if indicated by the parser,
+    // we save the full mime-message and add a flag
+    // that the ui should show button to display the full message.
+    //
+    // (currently, we skip saving mime-messages for encrypted messages
+    // as there is probably no huge intersection between html-messages and encrypted messages,
+    // however, that should be doable, we need the decrypted mime-structure in this case)
+
+    // a flag used to avoid adding "show full message" button to multiple parts of the message.
+    let mut save_mime_modified = mime_parser.is_mime_modified && !mime_parser.was_encrypted();
+
+    let mime_headers = if save_mime_headers || save_mime_modified {
         Some(String::from_utf8_lossy(imf_raw).to_string())
     } else {
         None
     };
+
     let sent_timestamp = *sent_timestamp;
     let is_hidden = *hidden;
     let chat_id = *chat_id;
@@ -826,8 +853,9 @@ async fn add_parts(
                     "INSERT INTO msgs \
          (rfc724_mid, server_folder, server_uid, chat_id, from_id, to_id, timestamp, \
          timestamp_sent, timestamp_rcvd, type, state, msgrmsg,  txt, txt_raw, param, \
-         bytes, hidden, mime_headers,  mime_in_reply_to, mime_references, error, ephemeral_timer, ephemeral_timestamp) \
-         VALUES (?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?, ?,?,?);",
+         bytes, hidden, mime_headers,  mime_in_reply_to, mime_references, mime_modified, \
+         error, ephemeral_timer, ephemeral_timestamp) \
+         VALUES (?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?);",
                 )?;
 
                 let is_location_kml = location_kml_is
@@ -839,6 +867,12 @@ async fn add_parts(
                     if incoming {
                         state = MessageState::InSeen; // Set the state to InSeen so that precheck_imf() adds a markseen job after we moved the message
                     }
+                }
+
+                let mime_modified = save_mime_modified && !part.msg.is_empty();
+                if mime_modified {
+                    // Avoid setting mime_modified for more than one part.
+                    save_mime_modified = false;
                 }
 
                 if part.typ == Viewtype::Text {
@@ -854,7 +888,9 @@ async fn add_parts(
                 } else {
                     match ephemeral_timer {
                         EphemeralTimer::Disabled => 0,
-                        EphemeralTimer::Enabled { duration } => rcvd_timestamp + i64::from(duration)
+                        EphemeralTimer::Enabled { duration } => {
+                            rcvd_timestamp + i64::from(duration)
+                        }
                     }
                 };
 
@@ -877,9 +913,14 @@ async fn add_parts(
                     part.param.to_string(),
                     part.bytes as isize,
                     is_hidden,
-                    mime_headers,
+                    if save_mime_headers || mime_modified {
+                        mime_headers.clone()
+                    } else {
+                        None
+                    },
                     mime_in_reply_to,
                     mime_references,
+                    mime_modified,
                     part.error.take().unwrap_or_default(),
                     ephemeral_timer,
                     ephemeral_timestamp
@@ -1144,42 +1185,38 @@ async fn create_or_lookup_group(
                 )
                 .await;
             X_MrAddToGrp = Some(optional_field);
-        } else {
-            let field = mime_parser.get(HeaderDef::ChatGroupNameChanged);
-            if let Some(field) = field {
-                X_MrGrpNameChanged = true;
-                better_msg = context
-                    .stock_system_msg(
-                        StockMessage::MsgGrpName,
-                        field,
-                        if let Some(ref name) = grpname {
-                            name
-                        } else {
-                            ""
-                        },
-                        from_id as u32,
-                    )
-                    .await;
-
-                mime_parser.is_system_message = SystemMessage::GroupNameChanged;
-            } else if let Some(value) = mime_parser.get(HeaderDef::ChatContent) {
-                if value == "group-avatar-changed" {
-                    if let Some(avatar_action) = &mime_parser.group_avatar {
-                        // this is just an explicit message containing the group-avatar,
-                        // apart from that, the group-avatar is send along with various other messages
-                        mime_parser.is_system_message = SystemMessage::GroupImageChanged;
-                        better_msg = context
-                            .stock_system_msg(
-                                match avatar_action {
-                                    AvatarAction::Delete => StockMessage::MsgGrpImgDeleted,
-                                    AvatarAction::Change(_) => StockMessage::MsgGrpImgChanged,
-                                },
-                                "",
-                                "",
-                                from_id as u32,
-                            )
-                            .await
-                    }
+        } else if let Some(old_name) = mime_parser.get(HeaderDef::ChatGroupNameChanged) {
+            X_MrGrpNameChanged = true;
+            better_msg = context
+                .stock_system_msg(
+                    StockMessage::MsgGrpName,
+                    old_name,
+                    if let Some(ref name) = grpname {
+                        name
+                    } else {
+                        ""
+                    },
+                    from_id as u32,
+                )
+                .await;
+            mime_parser.is_system_message = SystemMessage::GroupNameChanged;
+        } else if let Some(value) = mime_parser.get(HeaderDef::ChatContent) {
+            if value == "group-avatar-changed" {
+                if let Some(avatar_action) = &mime_parser.group_avatar {
+                    // this is just an explicit message containing the group-avatar,
+                    // apart from that, the group-avatar is send along with various other messages
+                    mime_parser.is_system_message = SystemMessage::GroupImageChanged;
+                    better_msg = context
+                        .stock_system_msg(
+                            match avatar_action {
+                                AvatarAction::Delete => StockMessage::MsgGrpImgDeleted,
+                                AvatarAction::Change(_) => StockMessage::MsgGrpImgChanged,
+                            },
+                            "",
+                            "",
+                            from_id as u32,
+                        )
+                        .await
                 }
             }
         }
@@ -1936,8 +1973,9 @@ mod tests {
     use super::*;
     use crate::chat::{ChatItem, ChatVisibility};
     use crate::chatlist::Chatlist;
+    use crate::constants::{DC_CONTACT_ID_INFO, DC_GCL_NO_SPECIALS};
     use crate::message::Message;
-    use crate::test_utils::*;
+    use crate::test_utils::TestContext;
 
     #[test]
     fn test_hex_hash() {
@@ -1950,7 +1988,8 @@ mod tests {
     #[async_std::test]
     async fn test_grpid_simple() {
         let context = TestContext::new().await;
-        let raw = b"From: hello\n\
+        let raw = b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                    From: hello\n\
                     Subject: outer-subject\n\
                     In-Reply-To: <lqkjwelq123@123123>\n\
                     References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
@@ -1967,7 +2006,8 @@ mod tests {
     #[async_std::test]
     async fn test_grpid_from_multiple() {
         let context = TestContext::new().await;
-        let raw = b"From: hello\n\
+        let raw = b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                    From: hello\n\
                     Subject: outer-subject\n\
                     In-Reply-To: <Gr.HcxyMARjyJy.9-qweqwe@asd.net>\n\
                     References: <qweqweqwe>, <Gr.HcxyMARjyJy.9-uvzWPTLtV@nau.ca>\n\
@@ -2001,7 +2041,9 @@ mod tests {
         );
     }
 
-    static MSGRMSG: &[u8] = b"From: Bob <bob@example.com>\n\
+    static MSGRMSG: &[u8] =
+        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                    From: Bob <bob@example.com>\n\
                     To: alice@example.com\n\
                     Chat-Version: 1.0\n\
                     Subject: Chat: hello\n\
@@ -2010,7 +2052,9 @@ mod tests {
                     \n\
                     hello\n";
 
-    static ONETOONE_NOREPLY_MAIL: &[u8] = b"From: Bob <bob@example.com>\n\
+    static ONETOONE_NOREPLY_MAIL: &[u8] =
+        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                    From: Bob <bob@example.com>\n\
                     To: alice@example.com\n\
                     Subject: Chat: hello\n\
                     Message-ID: <2222@example.com>\n\
@@ -2018,7 +2062,9 @@ mod tests {
                     \n\
                     hello\n";
 
-    static GRP_MAIL: &[u8] = b"From: bob@example.com\n\
+    static GRP_MAIL: &[u8] =
+        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                    From: bob@example.com\n\
                     To: alice@example.com, claire@example.com\n\
                     Subject: group with Alice, Bob and Claire\n\
                     Message-ID: <3333@example.com>\n\
@@ -2185,7 +2231,8 @@ mod tests {
         dc_receive_imf(
             &t,
             format!(
-                "From: alice@example.com\n\
+                "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: alice@example.com\n\
                  To: bob@example.com\n\
                  Subject: foo\n\
                  Message-ID: <Gr.{}.12345678901@example.com>\n\
@@ -2223,7 +2270,8 @@ mod tests {
         dc_receive_imf(
             &t,
             format!(
-                "From: bob@example.com\n\
+                "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: bob@example.com\n\
                  To: alice@example.com\n\
                  Subject: message opened\n\
                  Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
@@ -2287,7 +2335,8 @@ mod tests {
 
         dc_receive_imf(
             context,
-            b"To: bob@example.com\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 To: bob@example.com\n\
                  Subject: foo\n\
                  Message-ID: <3924@example.com>\n\
                  Chat-Version: 1.0\n\
@@ -2315,7 +2364,8 @@ mod tests {
         let chat_id = chat::create_by_contact_id(&t, contact_id).await.unwrap();
         dc_receive_imf(
             &t,
-            b"From: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= <foobar@example.com>\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= <foobar@example.com>\n\
                  To: alice@example.com\n\
                  Subject: foo\n\
                  Message-ID: <asdklfjjaweofi@example.com>\n\
@@ -2363,7 +2413,8 @@ mod tests {
 
         dc_receive_imf(
             &t,
-            b"From: Foobar <foobar@example.com>\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: Foobar <foobar@example.com>\n\
                  To: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= alice@example.com\n\
                  Cc: =?utf-8?q?=3Ch2=3E?= <carl@host.tld>\n\
                  Subject: foo\n\
@@ -2411,7 +2462,8 @@ mod tests {
 
         dc_receive_imf(
             &t,
-            b"From: Foobar <foobar@example.com>\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: Foobar <foobar@example.com>\n\
                  To: alice@example.com\n\
                  Cc: Carl <carl@host.tld>\n\
                  Subject: foo\n\
@@ -2522,7 +2574,8 @@ mod tests {
         dc_receive_imf(
             &t,
             format!(
-                "From: {}\n\
+                "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                From: {}\n\
                 To: {}\n\
                 Subject: foo\n\
                 Message-ID: <{}>\n\
@@ -2568,7 +2621,8 @@ mod tests {
 
         dc_receive_imf(
             &t,
-            b"From: alice@gmail.com\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: alice@gmail.com\n\
                  To: bob@example.com, assidhfaaspocwaeofi@gmail.com\n\
                  Subject: foo\n\
                  Message-ID: <CADWx9Cs32Wa7Gy-gM0bvbq54P_FEHe7UcsAV=yW7sVVW=fiMYQ@mail.gmail.com>\n\

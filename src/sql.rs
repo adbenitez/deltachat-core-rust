@@ -9,18 +9,23 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Error as SqlError, OpenFlags};
 
+use crate::chat::add_device_msg;
+use crate::config::Config::DeleteServerAfter;
 use crate::constants::{ShowEmails, DC_CHAT_ID_TRASH};
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::{dc_delete_file, time, EmailAddress};
 use crate::ephemeral::start_ephemeral_timers;
 use crate::error::format_err;
-use crate::param::*;
-use crate::peerstate::*;
+use crate::imap;
+use crate::param::{Param, Params};
+use crate::peerstate::Peerstate;
 use crate::provider::get_provider_by_domain;
+use crate::stock::StockMessage;
 use crate::{
     chat::{update_device_icon, update_saved_messages_icon},
     config::Config,
 };
+use crate::{constants::Viewtype, message::Message};
 
 #[macro_export]
 macro_rules! paramsv {
@@ -216,6 +221,31 @@ impl Sql {
             conn.pragma(None, "table_info", &name, |_row| {
                 // will only be executed if the info was found
                 exists = true;
+                Ok(())
+            })?;
+
+            Ok(exists)
+        })
+        .await
+    }
+
+    /// Check if a column exists in a given table.
+    pub async fn col_exists(
+        &self,
+        table_name: impl AsRef<str>,
+        col_name: impl AsRef<str>,
+    ) -> Result<bool> {
+        let table_name = table_name.as_ref().to_string();
+        let col_name = col_name.as_ref().to_string();
+        self.with_conn(move |conn| {
+            let mut exists = false;
+            // `PRAGMA table_info` returns one row per column,
+            // each row containing 0=cid, 1=name, 2=type, 3=notnull, 4=dflt_value
+            conn.pragma(None, "table_info", &table_name, |row| {
+                let curr_name: String = row.get(1)?;
+                if col_name == curr_name {
+                    exists = true;
+                }
                 Ok(())
             })?;
 
@@ -940,6 +970,7 @@ CREATE INDEX devmsglabels_index1 ON devmsglabels (label);
         let mut dbversion = dbversion_before_update;
         let mut recalc_fingerprints = false;
         let mut update_icons = !exists_before_update;
+        let mut disable_server_delete = false;
 
         if dbversion < 1 {
             info!(context, "[migration] v1");
@@ -1413,6 +1444,44 @@ CREATE INDEX devmsglabels_index1 ON devmsglabels (label);
 
             sql.set_raw_config_int(context, "dbversion", 71).await?;
         }
+        if dbversion < 72 {
+            info!(context, "[migration] v72");
+            if !sql.col_exists("msgs", "mime_modified").await? {
+                sql.execute(
+                    "ALTER TABLE msgs ADD COLUMN mime_modified INTEGER DEFAULT 0;",
+                    paramsv![],
+                )
+                .await?;
+            }
+            sql.set_raw_config_int(context, "dbversion", 72).await?;
+        }
+        if dbversion < 73 {
+            use Config::*;
+            info!(context, "[migration] v73");
+            sql.execute(
+                "CREATE TABLE imap_sync (folder TEXT PRIMARY KEY, uidvalidity INTEGER DEFAULT 0, uid_next INTEGER DEFAULT 0);",
+                paramsv![],
+            )
+            .await?;
+            for c in &[
+                ConfiguredInboxFolder,
+                ConfiguredSentboxFolder,
+                ConfiguredMvboxFolder,
+            ] {
+                if let Some(folder) = context.get_config(*c).await {
+                    let (uid_validity, last_seen_uid) =
+                        imap::get_config_last_seen_uid(context, &folder).await;
+                    if last_seen_uid > 0 {
+                        imap::set_uid_next(context, &folder, last_seen_uid + 1).await?;
+                        imap::set_uidvalidity(context, &folder, uid_validity).await?;
+                    }
+                }
+            }
+            if exists_before_update {
+                disable_server_delete = true;
+            }
+            sql.set_raw_config_int(context, "dbversion", 73).await?;
+        }
 
         // (2) updates that require high-level objects
         // (the structure is complete now and all objects are usable)
@@ -1443,6 +1512,21 @@ CREATE INDEX devmsglabels_index1 ON devmsglabels (label);
             update_saved_messages_icon(context).await?;
             update_device_icon(context).await?;
         }
+        if disable_server_delete {
+            // We now always watch all folders and delete messages there if delete_server is enabled.
+            // So, for people who have delete_server enabled, disable it and add a hint to the devicechat:
+            if context.get_config_delete_server_after().await.is_some() {
+                let mut msg = Message::new(Viewtype::Text);
+                msg.text = Some(
+                    context
+                        .stock_str(StockMessage::DeleteServerTurnedOff)
+                        .await
+                        .into(),
+                );
+                add_device_msg(context, None, Some(&mut msg)).await?;
+                context.set_config(DeleteServerAfter, Some("0")).await?;
+            }
+        }
     }
 
     info!(context, "Opened {:?}.", dbfile.as_ref(),);
@@ -1468,6 +1552,7 @@ async fn prune_tombstones(context: &Context) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::test_utils::TestContext;
 
     #[test]
     fn test_maybe_add_file() {
@@ -1493,5 +1578,20 @@ mod test {
         assert!(is_file_in_use(&files, None, "hello"));
         assert!(!is_file_in_use(&files, Some(".txt"), "hello"));
         assert!(is_file_in_use(&files, Some("-suffix"), "world.txt-suffix"));
+    }
+
+    #[async_std::test]
+    async fn test_table_exists() {
+        let t = TestContext::new().await;
+        assert!(t.ctx.sql.table_exists("msgs").await.unwrap());
+        assert!(!t.ctx.sql.table_exists("foobar").await.unwrap());
+    }
+
+    #[async_std::test]
+    async fn test_col_exists() {
+        let t = TestContext::new().await;
+        assert!(t.ctx.sql.col_exists("msgs", "mime_modified").await.unwrap());
+        assert!(!t.ctx.sql.col_exists("msgs", "foobar").await.unwrap());
+        assert!(!t.ctx.sql.col_exists("foobar", "foobar").await.unwrap());
     }
 }

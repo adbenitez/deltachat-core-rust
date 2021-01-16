@@ -459,8 +459,6 @@ class Account(object):
         If sending out was unsuccessful, a RuntimeError is raised.
         """
         self.check_is_configured()
-        if not self.is_started():
-            raise RuntimeError("IO not running, can not send out")
         res = lib.dc_initiate_key_transfer(self._dc_context)
         if res == ffi.NULL:
             raise RuntimeError("could not send out autocrypt setup message")
@@ -579,21 +577,18 @@ class Account(object):
             raise ValueError("account not configured, cannot start io")
         lib.dc_start_io(self._dc_context)
 
-    def configure(self):
+    def configure(self, reconfigure=False):
         """ Start configuration process and return a Configtracker instance
         on which you can block with wait_finish() to get a True/False success
         value for the configuration process.
         """
-        assert not self.is_configured()
+        assert self.is_configured() == reconfigure
         if not self.get_config("addr") or not self.get_config("mail_pw"):
             raise MissingCredentials("addr or mail_pwd not set in config")
         configtracker = ConfigureTracker(self)
         self.add_account_plugin(configtracker)
         lib.dc_configure(self._dc_context)
         return configtracker
-
-    def is_started(self):
-        return self._event_thread.is_alive() and bool(lib.dc_is_io_running(self._dc_context))
 
     def wait_shutdown(self):
         """ wait until shutdown of this account has completed. """
@@ -604,11 +599,8 @@ class Account(object):
         self.log("stop_ongoing")
         self.stop_ongoing()
 
-        if bool(lib.dc_is_io_running(self._dc_context)):
-            self.log("dc_stop_io (stop core IO scheduler)")
-            lib.dc_stop_io(self._dc_context)
-        else:
-            self.log("stop_scheduler called on non-running context")
+        self.log("dc_stop_io (stop core IO scheduler)")
+        lib.dc_stop_io(self._dc_context)
 
     def shutdown(self):
         """ shutdown and destroy account (stop callback thread, close and remove

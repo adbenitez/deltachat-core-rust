@@ -10,9 +10,9 @@ use once_cell::sync::Lazy;
 use crate::aheader::Aheader;
 use crate::blob::BlobObject;
 use crate::constants::Viewtype;
-use crate::contact::*;
+use crate::contact::addr_normalize;
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::dc_get_filemeta;
 use crate::dehtml::dehtml;
 use crate::e2ee;
 use crate::error::{bail, Result};
@@ -22,9 +22,9 @@ use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::Fingerprint;
 use crate::location;
 use crate::message;
-use crate::param::*;
+use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
-use crate::simplify::*;
+use crate::simplify::simplify;
 use crate::stock::StockMessage;
 use charset::Charset;
 use percent_encoding::percent_decode_str;
@@ -65,6 +65,10 @@ pub struct MimeMessage {
     pub(crate) group_avatar: Option<AvatarAction>,
     pub(crate) mdn_reports: Vec<Report>,
     pub(crate) failure_report: Option<FailureReport>,
+
+    // if this flag is set, the parts/text/etc. are just close to the original mime-message;
+    // clients should offer a way to view the original message in this case
+    pub is_mime_modified: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -223,6 +227,7 @@ impl MimeMessage {
             user_avatar: None,
             group_avatar: None,
             failure_report: None,
+            is_mime_modified: false,
         };
         parser.parse_mime_recursive(context, &mail).await?;
         parser.maybe_remove_bad_parts();
@@ -598,6 +603,12 @@ impl MimeMessage {
                         }
                     }
                 }
+                if any_part_added && mail.subparts.len() > 1 {
+                    // there are other alternative parts, likely HTML,
+                    // so we might have missed some content on simplifying.
+                    // set mime-modified to force the ui to display a show-message button.
+                    self.is_mime_modified = true;
+                }
             }
             (mime::MULTIPART, "encrypted") => {
                 // we currently do not try to decrypt non-autocrypt messages
@@ -727,20 +738,26 @@ impl MimeMessage {
 
                         let mut dehtml_failed = false;
 
-                        let (simplified_txt, is_forwarded, top_quote) = if decoded_data.is_empty() {
-                            ("".to_string(), false, None)
-                        } else {
-                            let is_html = mime_type == mime::TEXT_HTML;
-                            let out = if is_html {
-                                dehtml(&decoded_data).unwrap_or_else(|| {
-                                    dehtml_failed = true;
-                                    decoded_data.clone()
-                                })
+                        let (simplified_txt, is_forwarded, is_cut, top_quote) =
+                            if decoded_data.is_empty() {
+                                ("".to_string(), false, false, None)
                             } else {
-                                decoded_data.clone()
+                                let is_html = mime_type == mime::TEXT_HTML;
+                                let out = if is_html {
+                                    self.is_mime_modified = true;
+                                    dehtml(&decoded_data).unwrap_or_else(|| {
+                                        dehtml_failed = true;
+                                        decoded_data.clone()
+                                    })
+                                } else {
+                                    decoded_data.clone()
+                                };
+                                simplify(out, self.has_chat_version())
                             };
-                            simplify(out, self.has_chat_version())
-                        };
+
+                        self.is_mime_modified = self.is_mime_modified
+                            || ((is_forwarded || is_cut || top_quote.is_some())
+                                && !self.has_chat_version());
 
                         let is_format_flowed = if let Some(format) = mail.ctype.params.get("format")
                         {
@@ -1426,7 +1443,7 @@ mod tests {
         constants::Blocked,
         dc_receive_imf::dc_receive_imf,
         message::{Message, MessageState, MessengerMessage},
-        test_utils::*,
+        test_utils::TestContext,
     };
     use mailparse::ParsedMail;
 
@@ -2561,5 +2578,68 @@ On 2020-10-25, Bob wrote:
         assert_eq!(msg.get_width(), 64);
         assert_eq!(msg.get_height(), 64);
         assert_eq!(msg.get_filemime().unwrap(), "image/png");
+    }
+
+    #[async_std::test]
+    async fn test_mime_modified_plain() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_plain_unspecified.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        assert!(!mimeparser.is_mime_modified);
+        assert_eq!(
+            mimeparser.parts[0].msg,
+            "This message does not have Content-Type nor Subject."
+        );
+    }
+
+    #[async_std::test]
+    async fn test_mime_modified_alt_plain_html() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_alt_plain_html.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        assert!(mimeparser.is_mime_modified);
+        assert_eq!(
+            mimeparser.parts[0].msg,
+            "mime-modified test – this is plain"
+        );
+    }
+
+    #[async_std::test]
+    async fn test_mime_modified_alt_plain() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_alt_plain.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        assert!(!mimeparser.is_mime_modified);
+        assert_eq!(
+            mimeparser.parts[0].msg,
+            "mime-modified test – \
+        mime-modified should not be set set as there is no html and no special stuff;\n\
+        although not being a delta-message.\n\
+        test some special html-characters as < > and & but also \" and ' :)"
+        );
+    }
+
+    #[async_std::test]
+    async fn test_mime_modified_alt_html() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_alt_html.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        assert!(mimeparser.is_mime_modified);
+        assert_eq!(
+            mimeparser.parts[0].msg,
+            "mime-modified test – mime-modified *set*; simplify is always regarded as lossy."
+        );
+    }
+
+    #[async_std::test]
+    async fn test_mime_modified_html() {
+        let t = TestContext::new().await;
+        let raw = include_bytes!("../test-data/message/text_html.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        assert!(mimeparser.is_mime_modified);
+        assert_eq!(
+            mimeparser.parts[0].msg,
+            "mime-modified test – mime-modified *set*; simplify is always regarded as lossy."
+        );
     }
 }

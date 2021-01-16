@@ -532,7 +532,6 @@ int             dc_is_configured   (const dc_context_t* context);
 /**
  * Start job and IMAP/SMTP tasks.
  * If IO is already running, nothing happens.
- * To check the current IO state, use dc_is_io_running().
  *
  * If the context was created by the dc_accounts_t account manager,
  * use dc_accounts_start_io() instead of this function.
@@ -543,19 +542,9 @@ int             dc_is_configured   (const dc_context_t* context);
 void            dc_start_io     (dc_context_t* context);
 
 /**
- * Check if IO (SMTP/IMAP/Jobs) has been started.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @return 1=IO is running; 
- *   0=IO is not running.
- */
-int             dc_is_io_running(const dc_context_t* context);
-
-/**
  * Stop job, IMAP, SMTP and other tasks and return when they
  * are finished.
- * To check the current IO state, use dc_is_io_running().
+ *
  * Even if IO is not running, there may be pending tasks,
  * so this function should always be called before releasing
  * context to ensure clean termination of event loop.
@@ -1445,6 +1434,54 @@ int             dc_set_chat_mute_duration             (dc_context_t* context, ui
  * @return Text string, must be released using dc_str_unref() after usage
  */
 char*           dc_get_msg_info              (dc_context_t* context, uint32_t msg_id);
+
+
+/**
+ * Get uncut message, if available.
+ *
+ * Delta Chat tries to break the message in simple parts as plain text or images
+ * that are retrieved using dc_msg_get_viewtype(), dc_msg_get_text(), dc_msg_get_file() and so on.
+ * This works totally fine for Delta Chat to Delta Chat communication,
+ * however, when the counterpart uses another E-Mail-client, this has limits:
+ *
+ * - even if we do some good job on removing quotes,
+ *   sometimes one needs to see them
+ * - HTML-only messages might lose information on conversion to text,
+ *   esp. when there are lots of embedded images
+ * - even if there is some plain text part for a HTML-message,
+ *   this is often poor and not nicely usable due to long links
+ *
+ * In these cases, dc_msg_has_html() returns 1
+ * and you can ask dc_get_msg_html() for some HTML-code
+ * that shows the uncut text (which is close to the original)
+ * For simplicity, the function _always_ returns HTML-code,
+ * this removes the need for the UI
+ * to deal with different formatting options of PLAIN-parts.
+ *
+ * **Note:** The returned HTML-code may contain scripts,
+ * external images that may be misused as hidden read-receipts and so on.
+ * Taking care of these parts
+ * while maintaining compatibility with the then generated HTML-code
+ * is not easily doable, if at all.
+ * Eg. taking care of tags and attributes is not sufficient,
+ * we would have to deal with linked content (eg. script, css),
+ * text (eg. script-blocks) and values (eg. javascript-protocol) as well;
+ * on this level, we have to deal with encodings, browser peculiarities and so on -
+ * and would still risk to oversee something and to break things.
+ *
+ * To avoid starting this cat-and-mouse game,
+ * and to close this issue in a sustainable way,
+ * it is up to the UI to display the HTML-code in an **appropriate sandbox environment** -
+ * that may eg. be an external browser or a WebView with scripting disabled.
+ *
+ * @memberof dc_context_t
+ * @param context The context object object.
+ * @param msg_id The message id for which the uncut text should be loaded
+ * @return Uncut text as HTML.
+ *     In case of errors, NULL is returned.
+ *     The result must be released using dc_str_unref().
+ */
+char*           dc_get_msg_html              (dc_context_t* context, uint32_t msg_id);
 
 
 /**
@@ -3601,6 +3638,32 @@ int dc_msg_get_videochat_type (const dc_msg_t* msg);
 #define DC_VIDEOCHATTYPE_UNKNOWN     0
 #define DC_VIDEOCHATTYPE_BASICWEBRTC 1
 #define DC_VIDEOCHATTYPE_JITSI       2
+
+
+/**
+ * Checks if the message has a full HTML version.
+ *
+ * Messages have a full HTML version
+ * if the original message _may_ contain important parts
+ * that are removed by some heuristics
+ * or if the message is just too long or too complex
+ * to get displayed properly by just using plain text.
+ * If so, the UI should offer a button as
+ * "Show full message" that shows the uncut message using dc_get_msg_html().
+ *
+ * Even if a "Show full message" button is recommended,
+ * the UI should display the text in the bubble
+ * using the normal dc_msg_get_text() function -
+ * which will still be fine in many cases.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return 0=Message as displayed using dc_msg_get_text() is just fine;
+ *     1=The message has a full HTML version,
+ *     should be displayed using dc_msg_get_text()
+ *     and a button to show the full version should be offered
+ */
+int dc_msg_has_html (dc_msg_t* msg);
 
 
 /**

@@ -297,16 +297,6 @@ pub unsafe extern "C" fn dc_start_io(context: *mut dc_context_t) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_is_io_running(context: *mut dc_context_t) -> libc::c_int {
-    if context.is_null() {
-        return 0;
-    }
-    let ctx = &*context;
-
-    block_on(ctx.is_io_running()) as libc::c_int
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_get_id(context: *mut dc_context_t) -> libc::c_int {
     if context.is_null() {
         return 0;
@@ -1387,6 +1377,20 @@ pub unsafe extern "C" fn dc_get_msg_info(
     let ctx = &*context;
 
     block_on(message::get_msg_info(&ctx, MsgId::new(msg_id))).strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_msg_html(
+    context: *mut dc_context_t,
+    msg_id: u32,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_msg_html()");
+        return ptr::null_mut();
+    }
+    let ctx = &*context;
+
+    block_on(MsgId::new(msg_id).get_html(&ctx)).strdup()
 }
 
 #[no_mangle]
@@ -2859,6 +2863,16 @@ pub unsafe extern "C" fn dc_msg_is_setupmessage(msg: *mut dc_msg_t) -> libc::c_i
     }
     let ffi_msg = &*msg;
     ffi_msg.message.is_setupmessage().into()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_msg_has_html(msg: *mut dc_msg_t) -> libc::c_int {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_has_html()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    ffi_msg.message.has_html().into()
 }
 
 #[no_mangle]

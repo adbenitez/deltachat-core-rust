@@ -21,16 +21,13 @@ impl Imap {
         watch_folder: Option<String>,
     ) -> Result<InterruptInfo> {
         use futures::future::FutureExt;
-        info!(context, "verbose (issue 2065): step 2 starting idle");
 
         if !self.can_idle() {
             bail!("IMAP server does not have IDLE capability");
         }
         self.setup_handle(context).await?;
-        info!(context, "verbose (issue 2065): step 3 setup handle");
 
         self.select_folder(context, watch_folder.clone()).await?;
-        info!(context, "verbose (issue 2065): step 4 selected folder");
 
         let timeout = Duration::from_secs(23 * 60);
         let mut info = Default::default();
@@ -47,14 +44,15 @@ impl Imap {
                     _ => info!(context, "ignoring unsolicited response {:?}", response),
                 }
             }
-            info!(context, "verbose (issue 2065): step 5 checked responsed");
 
             if unsolicited_exists {
                 self.session = Some(session);
-                info!(
-                    context,
-                    "verbose (issue 2065): exiting because unsolicited_exists"
-                );
+                return Ok(info);
+            }
+
+            if let Ok(info) = self.idle_interrupt.try_recv() {
+                info!(context, "skip idle, got interrupt {:?}", info);
+                self.session = Some(session);
                 return Ok(info);
             }
 
@@ -62,7 +60,6 @@ impl Imap {
             if let Err(err) = handle.init().await {
                 bail!("IMAP IDLE protocol failed to init/complete: {}", err);
             }
-            info!(context, "verbose (issue 2065): step 6 inited handle");
 
             let (idle_wait, interrupt) = handle.wait_with_timeout(timeout);
 
@@ -71,14 +68,18 @@ impl Imap {
                 Interrupt(InterruptInfo),
             }
 
-            info!(context, "Idle entering wait-on-remote state");
+            info!(
+                context,
+                "{}: Idle entering wait-on-remote state",
+                watch_folder.as_deref().unwrap_or("None")
+            );
             let fut = idle_wait.map(|ev| ev.map(Event::IdleResponse)).race(async {
-                let probe_network = self.idle_interrupt.recv().await;
+                let info = self.idle_interrupt.recv().await;
 
                 // cancel imap idle connection properly
                 drop(interrupt);
 
-                Ok(Event::Interrupt(probe_network.unwrap_or_default()))
+                Ok(Event::Interrupt(info.unwrap_or_default()))
             });
 
             match fut.await {
@@ -178,7 +179,7 @@ impl Imap {
                                 }
                             }
                             Err(err) => {
-                                error!(context, "could not fetch from folder: {}", err);
+                                error!(context, "could not fetch from folder: {:#}", err);
                                 self.trigger_reconnect()
                             }
                         }

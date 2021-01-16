@@ -11,19 +11,28 @@ use num_traits::FromPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobError, BlobObject};
-use crate::chatlist::*;
-use crate::config::*;
-use crate::constants::*;
-use crate::contact::*;
+use crate::chatlist::dc_get_archived_cnt;
+use crate::config::Config;
+use crate::constants::{
+    Blocked, Chattype, ShowEmails, Viewtype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK,
+    DC_CHAT_ID_DEADDROP, DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH, DC_CONTACT_ID_DEVICE,
+    DC_CONTACT_ID_INFO, DC_CONTACT_ID_LAST_SPECIAL, DC_CONTACT_ID_SELF, DC_GCM_ADDDAYMARKER,
+    DC_RESEND_USER_AVATAR_DAYS,
+};
+use crate::contact::{addr_cmp, Contact, Origin, VerifiedStatus};
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::{
+    dc_create_id, dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp,
+    dc_create_smeared_timestamps, dc_get_abs_path, dc_gm2local_offset, dc_str_to_color,
+    improve_single_line_input, time, IsNoneOrEmpty,
+};
 use crate::ephemeral::{delete_expired_messages, schedule_ephemeral_task, Timer as EphemeralTimer};
 use crate::error::{bail, ensure, format_err, Error};
 use crate::events::EventType;
 use crate::job::{self, Action};
 use crate::message::{self, InvalidMsgId, Message, MessageState, MsgId};
 use crate::mimeparser::SystemMessage;
-use crate::param::*;
+use crate::param::{Param, Params};
 use crate::sql;
 use crate::stock::StockMessage;
 
@@ -1611,10 +1620,6 @@ pub async fn send_msg_sync(
     chat_id: ChatId,
     msg: &mut Message,
 ) -> Result<MsgId, Error> {
-    if context.is_io_running().await {
-        return send_msg(context, chat_id, msg).await;
-    }
-
     if let Some(mut job) = prepare_send_msg(context, chat_id, msg).await? {
         let mut smtp = crate::smtp::Smtp::new();
 
@@ -2970,8 +2975,10 @@ pub(crate) async fn add_info_msg(context: &Context, chat_id: ChatId, text: impl 
 mod tests {
     use super::*;
 
+    use crate::chatlist::Chatlist;
+    use crate::constants::{DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS};
     use crate::contact::Contact;
-    use crate::test_utils::*;
+    use crate::test_utils::TestContext;
 
     #[async_std::test]
     async fn test_chat_info() {
@@ -3569,7 +3576,7 @@ mod tests {
             .unwrap();
         add_info_msg(&t, chat_id, "foo info").await;
 
-        let msg = t.get_last_msg(chat_id).await;
+        let msg = t.get_last_msg_in(chat_id).await;
         assert_eq!(msg.get_chat_id(), chat_id);
         assert_eq!(msg.get_viewtype(), Viewtype::Text);
         assert_eq!(msg.get_text().unwrap(), "foo info");
@@ -3599,7 +3606,7 @@ mod tests {
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::EphemeralTimerChanged);
 
-        let msg2 = t.get_last_msg(chat_id).await;
+        let msg2 = t.get_last_msg_in(chat_id).await;
         assert_eq!(msg.get_id(), msg2.get_id());
     }
 
@@ -3626,7 +3633,7 @@ mod tests {
         let msgs = get_chat_msgs(&t, chat_id, 0, None).await;
         assert_eq!(msgs.len(), 1);
 
-        let msg = t.get_last_msg(chat_id).await;
+        let msg = t.get_last_msg_in(chat_id).await;
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionEnabled);
         assert_eq!(msg.get_state(), MessageState::InNoticed);
@@ -3641,7 +3648,7 @@ mod tests {
         assert!(!chat.is_protected());
         assert!(chat.is_unpromoted());
 
-        let msg = t.get_last_msg(chat_id).await;
+        let msg = t.get_last_msg_in(chat_id).await;
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionDisabled);
         assert_eq!(msg.get_state(), MessageState::InNoticed);
@@ -3665,7 +3672,7 @@ mod tests {
         assert!(chat.is_protected());
         assert!(!chat.is_unpromoted());
 
-        let msg = t.get_last_msg(chat_id).await;
+        let msg = t.get_last_msg_in(chat_id).await;
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionEnabled);
         assert_eq!(msg.get_state(), MessageState::OutDelivered); // as bcc-self is disabled and there is nobody else in the chat

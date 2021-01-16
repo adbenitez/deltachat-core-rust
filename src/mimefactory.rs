@@ -4,18 +4,20 @@ use lettre_email::{mime, Address, Header, MimeMultipartType, PartBuilder};
 use crate::blob::BlobObject;
 use crate::chat::{self, Chat};
 use crate::config::Config;
-use crate::constants::*;
-use crate::contact::*;
+use crate::constants::{Chattype, Viewtype, DC_FROM_HANDSHAKE};
+use crate::contact::Contact;
 use crate::context::{get_version_str, Context};
-use crate::dc_tools::*;
-use crate::e2ee::*;
+use crate::dc_tools::{
+    dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp, dc_get_filebytes, time,
+};
+use crate::e2ee::EncryptHelper;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::error::{bail, ensure, format_err, Error};
 use crate::format_flowed::{format_flowed, format_flowed_quote};
 use crate::location;
 use crate::message::{self, Message};
 use crate::mimeparser::SystemMessage;
-use crate::param::*;
+use crate::param::Param;
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock::StockMessage;
@@ -754,11 +756,10 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                     }
                 }
                 SystemMessage::GroupNameChanged => {
-                    let value_to_add = self.msg.param.get(Param::Arg).unwrap_or_default();
-
+                    let old_name = self.msg.param.get(Param::Arg).unwrap_or_default();
                     protected_headers.push(Header::new(
                         "Chat-Group-Name-Changed".into(),
-                        value_to_add.into(),
+                        maybe_encode_words(old_name),
                     ));
                 }
                 SystemMessage::GroupImageChanged => {
@@ -1181,14 +1182,10 @@ async fn build_body_file(
     // at least on tested Thunderbird and Gma'l in 2017.
     // But I've heard about problems with inline and outl'k, so we just use the attachment-type until we
     // run into other problems ...
-    let cd_value = if needs_encoding(&filename_to_send) {
-        format!(
-            "attachment; filename=\"{}\"",
-            encode_words(&filename_to_send)
-        )
-    } else {
-        format!("attachment; filename=\"{}\"", &filename_to_send)
-    };
+    let cd_value = format!(
+        "attachment; filename=\"{}\"",
+        maybe_encode_words(&filename_to_send)
+    );
 
     let body = std::fs::read(blob.to_abs_path())?;
     let encoded_body = wrapped_base64_encode(&body);
@@ -1271,18 +1268,27 @@ fn encode_words(word: &str) -> String {
     encoded_words::encode(word, None, encoded_words::EncodingFlag::Shortest, None)
 }
 
-pub fn needs_encoding(to_check: impl AsRef<str>) -> bool {
+fn needs_encoding(to_check: impl AsRef<str>) -> bool {
     !to_check.as_ref().chars().all(|c| {
         c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' || c == '%'
     })
+}
+
+fn maybe_encode_words(words: &str) -> String {
+    if needs_encoding(words) {
+        encode_words(words)
+    } else {
+        words.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chatlist::Chatlist;
+    use crate::contact::Origin;
     use crate::dc_receive_imf::dc_receive_imf;
-    use crate::mimeparser::*;
+    use crate::mimeparser::MimeMessage;
     use crate::test_utils::TestContext;
 
     #[test]
@@ -1367,12 +1373,20 @@ mod tests {
         assert!(needs_encoding("foo bar"));
     }
 
+    #[test]
+    fn test_maybe_encode_words() {
+        assert_eq!(maybe_encode_words("foobar"), "foobar");
+        assert_eq!(maybe_encode_words("-_.~%"), "-_.~%");
+        assert_eq!(maybe_encode_words("äöü"), "=?utf-8?b?w6TDtsO8?=");
+    }
+
     #[async_std::test]
     async fn test_subject() {
         // 1.: Receive a mail from an MUA or Delta Chat
         assert_eq!(
             msg_to_subject_str(
-                b"From: Bob <bob@example.com>\n\
+                b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                From: Bob <bob@example.com>\n\
                 To: alice@example.com\n\
                 Subject: Antw: Chat: hello\n\
                 Message-ID: <2222@example.com>\n\
@@ -1386,7 +1400,8 @@ mod tests {
 
         assert_eq!(
             msg_to_subject_str(
-                b"From: Bob <bob@example.com>\n\
+                b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                From: Bob <bob@example.com>\n\
                 To: alice@example.com\n\
                 Subject: Infos: 42\n\
                 Message-ID: <2222@example.com>\n\
@@ -1401,7 +1416,8 @@ mod tests {
         // 2. Receive a message from Delta Chat when we did not send any messages before
         assert_eq!(
             msg_to_subject_str(
-                b"From: Charlie <charlie@example.com>\n\
+                b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                From: Charlie <charlie@example.com>\n\
                 To: alice@example.com\n\
                 Subject: Chat: hello\n\
                 Chat-Version: 1.0\n\
@@ -1427,7 +1443,8 @@ mod tests {
 
         // 4. Receive messages with unicode characters and make sure that we do not panic (we do not care about the result)
         msg_to_subject_str(
-            "From: Charlie <charlie@example.com>\n\
+            "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+            From: Charlie <charlie@example.com>\n\
             To: alice@example.com\n\
             Subject: äääää\n\
             Chat-Version: 1.0\n\
@@ -1440,7 +1457,8 @@ mod tests {
         .await;
 
         msg_to_subject_str(
-            "From: Charlie <charlie@example.com>\n\
+            "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+            From: Charlie <charlie@example.com>\n\
             To: alice@example.com\n\
             Subject: aäääää\n\
             Chat-Version: 1.0\n\
@@ -1456,7 +1474,8 @@ mod tests {
         let t = TestContext::new_alice().await;
         dc_receive_imf(
             &t,
-            b"From: alice@example.com\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+            From: alice@example.com\n\
             To: Charlie <charlie@example.com>\n\
             Subject: Hello, Charlie\n\
             Chat-Version: 1.0\n\
@@ -1470,7 +1489,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let new_msg = incoming_msg_to_reply_msg(b"From: charlie@example.com\n\
+        let new_msg = incoming_msg_to_reply_msg(
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                 From: charlie@example.com\n\
                  To: alice@example.com\n\
                  Subject: message opened\n\
                  Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
@@ -1559,7 +1580,8 @@ mod tests {
         let context = &t;
 
         let msg = incoming_msg_to_reply_msg(
-            b"From: Charlie <charlie@example.com>\n\
+            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+                From: Charlie <charlie@example.com>\n\
                 To: alice@example.com\n\
                 Subject: Chat: hello\n\
                 Chat-Version: 1.0\n\

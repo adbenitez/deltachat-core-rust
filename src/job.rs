@@ -10,21 +10,22 @@ use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
 use rand::{thread_rng, Rng};
 
+use anyhow::Context as _;
 use async_smtp::smtp::response::Category;
 use async_smtp::smtp::response::Code;
 use async_smtp::smtp::response::Detail;
 
 use crate::context::Context;
-use crate::dc_tools::*;
+use crate::dc_tools::{dc_delete_file, dc_read_file, time};
 use crate::ephemeral::load_imap_deletion_msgid;
 use crate::error::{bail, ensure, format_err, Error, Result};
 use crate::events::EventType;
-use crate::imap::*;
+use crate::imap::{Imap, ImapActionResult};
 use crate::location;
 use crate::message::MsgId;
 use crate::message::{self, Message, MessageState};
 use crate::mimefactory::MimeFactory;
-use crate::param::*;
+use crate::param::{Param, Params};
 use crate::smtp::Smtp;
 use crate::{blob::BlobObject, contact::normalize_name, contact::Modifier, contact::Origin};
 use crate::{
@@ -511,11 +512,27 @@ impl Job {
         }
 
         let msg = job_try!(Message::load_from_db(context, MsgId::new(self.foreign_id)).await);
-        let dest_folder = context.get_config(Config::ConfiguredMvboxFolder).await;
+        let server_folder = &job_try!(msg
+            .server_folder
+            .context("Can't move message out of folder if we don't know the current folder"));
+
+        let move_res = msg.id.needs_move(context, server_folder).await;
+        let dest_folder = match move_res {
+            Err(e) => {
+                warn!(context, "could not load dest folder: {}", e);
+                return Status::RetryLater;
+            }
+            Ok(None) => {
+                warn!(
+                    context,
+                    "msg {} does not need to be moved from {}", msg.id, server_folder
+                );
+                return Status::Finished(Ok(()));
+            }
+            Ok(Some(config)) => context.get_config(config).await,
+        };
 
         if let Some(dest_folder) = dest_folder {
-            let server_folder = msg.server_folder.as_ref().unwrap();
-
             match imap
                 .mv(context, server_folder, msg.server_uid, &dest_folder)
                 .await
@@ -753,6 +770,7 @@ impl Job {
             // retry. If the message was moved, we will create another
             // job to mark the message as seen later. If it was
             // deleted, there is nothing to do.
+            info!(context, "Can't mark message as seen: No UID");
             ImapActionResult::Failed
         } else {
             imap.set_seen(context, folder, msg.server_uid).await
@@ -847,7 +865,8 @@ async fn add_all_recipients_as_contacts(context: &Context, imap: &mut Imap, fold
         return;
     };
     if let Err(e) = imap.select_with_uidvalidity(context, &mailbox).await {
-        warn!(context, "Could not select {}: {}", mailbox, e);
+        // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
+        warn!(context, "Could not select {}: {:#}", mailbox, e);
         return;
     }
     match imap.get_all_recipients(context).await {
@@ -1365,7 +1384,7 @@ LIMIT 1;
 mod tests {
     use super::*;
 
-    use crate::test_utils::*;
+    use crate::test_utils::TestContext;
 
     async fn insert_job(context: &Context, foreign_id: i64) {
         let now = time();
