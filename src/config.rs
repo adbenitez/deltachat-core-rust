@@ -3,7 +3,6 @@
 use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
-use crate::blob::BlobObject;
 use crate::chat::ChatId;
 use crate::constants::DC_VERSION_STR;
 use crate::context::Context;
@@ -13,6 +12,10 @@ use crate::job;
 use crate::message::MsgId;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::stock::StockMessage;
+use crate::{
+    blob::BlobObject,
+    provider::{get_provider_by_id, Provider},
+};
 
 /// The available configuration keys.
 #[derive(
@@ -34,9 +37,6 @@ pub enum Config {
     SendSecurity,
     SmtpCertificateChecks,
     ServerFlags,
-
-    #[strum(props(default = "INBOX"))]
-    ImapFolder,
 
     Displayname,
     Selfstatus,
@@ -215,6 +215,14 @@ impl Context {
         }
     }
 
+    /// Gets the configured provider, as saved in the `configured_provider` value.
+    ///
+    /// The provider is determined by `get_provider_info()` during configuration and then saved
+    /// to the db in `param.save_to_database()`, together with all the other `configured_*` values.
+    pub async fn get_configured_provider(&self) -> Option<&'static Provider> {
+        get_provider_by_id(&self.get_config(Config::ConfiguredProvider).await?)
+    }
+
     /// Gets configured "delete_device_after" value.
     ///
     /// `None` means never delete the message, `Some(x)` means delete
@@ -317,11 +325,6 @@ mod tests {
             Config::from_str("sys.config_keys"),
             Ok(Config::SysConfigKeys)
         );
-    }
-
-    #[test]
-    fn test_default_prop() {
-        assert_eq!(Config::ImapFolder.get_str("default"), Some("INBOX"));
     }
 
     #[async_std::test]
