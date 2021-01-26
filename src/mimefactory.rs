@@ -268,7 +268,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         }
     }
 
-    fn should_force_plaintext(&self) -> bool {
+    async fn should_force_plaintext(&self) -> bool {
         match &self.loaded {
             Loaded::Message { chat } => {
                 if chat.is_protected() {
@@ -286,7 +286,7 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
         }
     }
 
-    fn should_skip_autocrypt(&self) -> bool {
+    async fn should_skip_autocrypt(&self) -> bool {
         match &self.loaded {
             Loaded::Message { .. } => self
                 .msg
@@ -488,8 +488,8 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
 
         let min_verified = self.min_verified();
         let grpimage = self.grpimage();
-        let force_plaintext = self.should_force_plaintext();
-        let skip_autocrypt = self.should_skip_autocrypt();
+        let force_plaintext = self.should_force_plaintext().await;
+        let skip_autocrypt = self.should_skip_autocrypt().await;
         let subject_str = self.subject_str().await;
         let e2ee_guaranteed = self.is_e2ee_guaranteed();
         let encrypt_helper = EncryptHelper::new(self.context).await?;
