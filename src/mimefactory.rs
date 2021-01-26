@@ -278,6 +278,8 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                         .param
                         .get_bool(Param::ForcePlaintext)
                         .unwrap_or_default()
+			|| (!self.context.get_config_bool(Config::E2eeEnabled).await
+			    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default())
                 }
             }
             Loaded::MDN { .. } => true,
@@ -290,7 +292,9 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
                 .msg
                 .param
                 .get_bool(Param::SkipAutocrypt)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+		|| (!self.context.get_config_bool(Config::E2eeEnabled).await
+		    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()),
             Loaded::MDN { .. } => true,
         }
     }
@@ -513,10 +517,6 @@ impl<'a, 'b> MimeFactory<'a, 'b> {
             // unless determined otherwise we add the Autocrypt header
             let aheader = encrypt_helper.get_aheader().to_string();
             unprotected_headers.push(Header::new("Autocrypt".into(), aheader));
-        }
-
-        if self.context.get_config_bool(Config::E2eeEnabled).await {
-            protected_headers.push(Header::new("Subject".into(), subject));
         }
 
         let peerstates = self.peerstates_for_recipients().await?;
