@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str;
 
+use anyhow::{bail, Error};
 use async_std::path::PathBuf;
 use itertools::Itertools;
 use num_traits::FromPrimitive;
@@ -9,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobError, BlobObject};
 use crate::context::Context;
-use crate::error::{self, bail};
 use crate::message::MsgId;
 use crate::mimeparser::SystemMessage;
 
@@ -50,7 +50,8 @@ pub enum Param {
     /// For Messages
     WantsMdn = b'r',
 
-    /// For Messages
+    /// For Messages: unset or 0=not forwarded,
+    /// 1=forwarded from unknown msg_id, >9 forwarded from msg_id
     Forwarded = b'a',
 
     /// For Messages: quoted text.
@@ -162,7 +163,7 @@ impl fmt::Display for Params {
 }
 
 impl str::FromStr for Params {
-    type Err = error::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut inner = BTreeMap::new();

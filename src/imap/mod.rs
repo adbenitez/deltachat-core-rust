@@ -5,7 +5,7 @@
 
 use std::{cmp, cmp::max, collections::BTreeMap};
 
-use anyhow::Context as _;
+use anyhow::{bail, format_err, Context as _, Result};
 use async_imap::{
     error::Result as ImapResult,
     types::{Capability, Fetch, Flag, Mailbox, Name, NameAttribute},
@@ -15,12 +15,11 @@ use async_std::sync::Receiver;
 use num_traits::FromPrimitive;
 
 use crate::constants::{
-    ShowEmails, Viewtype, DC_CONTACT_ID_SELF, DC_FETCH_EXISTING_MSGS_COUNT,
+    Chattype, ShowEmails, Viewtype, DC_CONTACT_ID_SELF, DC_FETCH_EXISTING_MSGS_COUNT,
     DC_FOLDERS_CONFIGURED_VERSION, DC_LP_AUTH_OAUTH2,
 };
 use crate::context::Context;
 use crate::dc_receive_imf::{from_field_to_contact_id, get_prefetch_parent_message};
-use crate::error::{bail, format_err, Result};
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::job::{self, Action};
@@ -1603,22 +1602,30 @@ pub(crate) async fn prefetch_should_download(
     headers: &[mailparse::MailHeader<'_>],
     show_emails: ShowEmails,
 ) -> Result<bool> {
+    let is_chat_message = headers.get_header_value(HeaderDef::ChatVersion).is_some();
+    let parent = get_prefetch_parent_message(context, headers).await?;
+    let is_reply_to_chat_message = parent.is_some();
+    if let Some(parent) = parent {
+        let chat = chat::Chat::load_from_db(context, parent.get_chat_id()).await?;
+        if chat.typ == Chattype::Group {
+            // This might be a group command, like removing a group member.
+            // We really need to fetch this to avoid inconsistent group state.
+            return Ok(true);
+        }
+    }
+
+    // Same as previous check, but using group IDs embedded into
+    // Message-IDs as a last resort, in case parent message was
+    // deleted from the database or has not arrived yet.
     if let Some(rfc724_mid) = headers.get_header_value(HeaderDef::MessageId) {
         if let Some(group_id) = dc_extract_grpid_from_rfc724_mid(&rfc724_mid) {
             if let Ok((chat_id, _, _)) = get_chat_id_by_grpid(context, group_id).await {
                 if !chat_id.is_unset() {
-                    // This might be a group command, like removing a group member.
-                    // We really need to fetch this to avoid inconsistent group state.
                     return Ok(true);
                 }
             }
         }
     }
-
-    let is_chat_message = headers.get_header_value(HeaderDef::ChatVersion).is_some();
-    let is_reply_to_chat_message = get_prefetch_parent_message(context, headers)
-        .await?
-        .is_some();
 
     let maybe_ndn = if let Some(from) = headers.get_header_value(HeaderDef::From_) {
         let from = from.to_ascii_lowercase();

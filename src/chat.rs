@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
+use anyhow::{bail, ensure, format_err, Error};
 use async_std::path::{Path, PathBuf};
 use itertools::Itertools;
 use num_traits::FromPrimitive;
@@ -28,7 +29,6 @@ use crate::dc_tools::{
     improve_single_line_input, time, IsNoneOrEmpty,
 };
 use crate::ephemeral::{delete_expired_messages, schedule_ephemeral_task, Timer as EphemeralTimer};
-use crate::error::{bail, ensure, format_err, Error};
 use crate::events::EventType;
 use crate::job::{self, Action};
 use crate::message::{self, InvalidMsgId, Message, MessageState, MsgId};
@@ -699,7 +699,7 @@ pub struct Chat {
     pub name: String,
     pub visibility: ChatVisibility,
     pub grpid: String,
-    blocked: Blocked,
+    pub(crate) blocked: Blocked,
     pub param: Params,
     is_sending_locations: bool,
     pub mute_duration: MuteDuration,
@@ -1060,6 +1060,12 @@ impl Chat {
             EphemeralTimer::Enabled { duration } => time() + i64::from(duration),
         };
 
+        let new_mime_headers = if msg.param.exists(Param::Forwarded) && msg.mime_modified {
+            msg.get_id().get_html_as_rawmime(context).await
+        } else {
+            None
+        };
+
         // add message to the database
 
         if context
@@ -1078,10 +1084,12 @@ impl Chat {
                         hidden,
                         mime_in_reply_to,
                         mime_references,
+                        mime_modified,
+                        mime_headers,
                         location_id,
                         ephemeral_timer,
                         ephemeral_timestamp)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 paramsv![
                     new_rfc724_mid,
                     self.id,
@@ -1095,6 +1103,8 @@ impl Chat {
                     msg.hidden,
                     msg.in_reply_to.as_deref().unwrap_or_default(),
                     new_references,
+                    new_mime_headers.is_some(),
+                    new_mime_headers,
                     location_id as i32,
                     ephemeral_timer,
                     ephemeral_timestamp
@@ -2738,7 +2748,8 @@ pub async fn forward_msgs(
             // we tested a sort of broadcast
             // by not marking own forwarded messages as such,
             // however, this turned out to be to confusing and unclear.
-            msg.param.set_int(Param::Forwarded, 1);
+            msg.param
+                .set_int(Param::Forwarded, src_msg_id.to_u32() as i32);
 
             msg.param.remove(Param::GuaranteeE2ee);
             msg.param.remove(Param::ForcePlaintext);

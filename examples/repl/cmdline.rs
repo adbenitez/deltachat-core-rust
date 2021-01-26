@@ -2,7 +2,7 @@ extern crate dirs;
 
 use std::str::FromStr;
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Error};
 use async_std::path::Path;
 use deltachat::chat::{self, Chat, ChatId, ChatItem, ChatVisibility, ProtectionStatus};
 use deltachat::chatlist::*;
@@ -11,7 +11,6 @@ use deltachat::contact::*;
 use deltachat::context::*;
 use deltachat::dc_receive_imf::*;
 use deltachat::dc_tools::*;
-use deltachat::error::Error;
 use deltachat::imex::*;
 use deltachat::location;
 use deltachat::lot::LotState;
@@ -951,7 +950,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let file = dirs::home_dir()
                 .unwrap_or_default()
                 .join(format!("msg-{}.html", id.to_u32()));
-            let html = id.get_html(&context).await;
+            let html = id.get_html(&context).await.unwrap_or_default();
             fs::write(&file, html)?;
             println!("HTML written to: {:#?}", file);
         }
