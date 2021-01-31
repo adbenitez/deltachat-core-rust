@@ -5312,9 +5312,9 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_WEEK             80
 
-/// "Message deletion timer is set to 4 weeks."
+/// DEPRECATED
 ///
-/// Used in status messages.
+/// DC_STR_EPHEMERAL_WEEKS is used instead.
 #define DC_STR_EPHEMERAL_FOUR_WEEKS       81
 
 /// "Video chat invitation"
@@ -5366,10 +5366,43 @@ void dc_event_unref(dc_event_t* event);
 /// Note: the string has to be a noun, not a verb (not: "to reply").
 #define DC_STR_REPLY_NOUN                 90
 
-/// "'Delete messages from server' turned off as now all folders are affected."
+/// "You deleted the 'Saved messages' chat..."
 ///
 /// Used as device message text.
 #define DC_STR_SELF_DELETED_MSG_BODY      91
+
+/// "'Delete messages from server' turned off as now all folders are affected."
+///
+/// Used as device message text.
+#define DC_STR_SERVER_TURNED_OFF          92
+
+/// "Message deletion timer is set to %1$s minutes."
+///
+/// Used in status messages.
+//
+/// `%1$s` will be replaced by the number of minutes (alwasy >1) the timer is set to.
+#define DC_STR_EPHEMERAL_MINUTES          93
+
+/// "Message deletion timer is set to %1$s hours."
+///
+/// Used in status messages.
+//
+/// `%1$s` will be replaced by the number of hours (always >1) the timer is set to.
+#define DC_STR_EPHEMERAL_HOURS            94
+
+/// "Message deletion timer is set to %1$s days."
+///
+/// Used in status messages.
+//
+/// `%1$s` will be replaced by the number of days (always >1) the timer is set to.
+#define DC_STR_EPHEMERAL_DAYS             95
+
+/// "Message deletion timer is set to %1$s weeks."
+///
+/// Used in status messages.
+//
+/// `%1$s` will be replaced by the number of weeks (always >1) the timer is set to.
+#define DC_STR_EPHEMERAL_WEEKS            96
 
 /**
  * @}
