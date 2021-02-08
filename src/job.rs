@@ -2,7 +2,6 @@
 //!
 //! This module implements a job queue maintained in the SQLite database
 //! and job types.
-
 use std::fmt;
 use std::future::Future;
 
@@ -248,7 +247,7 @@ impl Job {
             info!(context, "smtp-sending out mime message:");
             println!("{}", String::from_utf8_lossy(&message));
         }
-        match smtp.send(context, recipients, message, job_id).await {
+        let status = match smtp.send(context, recipients, message, job_id).await {
             Err(crate::smtp::send::Error::SendError(err)) => {
                 // Remote error, retry later.
                 warn!(context, "SMTP failed to send: {}", err);
@@ -273,7 +272,7 @@ impl Job {
                                 // Other enhanced status codes, such as Postfix
                                 // "550 5.1.1 <foobar@example.org>: Recipient address rejected: User unknown in local recipient table"
                                 // are not ignored.
-                                response.message.get(0) == Some(&"5.5.0".to_string())
+                                response.first_word() == Some(&"5.5.0".to_string())
                             }
                             _ => false,
                         };
@@ -285,25 +284,30 @@ impl Job {
                             // Yandex error "554 5.7.1 [2] Message rejected under suspicion of SPAM; https://ya.cc/..."
                             // should definitely go here, because user has to open the link to
                             // resume message sending.
-                            let msg_id = MsgId::new(self.foreign_id);
-                            message::set_msg_failed(context, msg_id, Some(err.to_string())).await;
-                            match Message::load_from_db(context, msg_id).await {
-                                Ok(message) => {
-                                    chat::add_info_msg(context, message.chat_id, err.to_string())
-                                        .await
-                                }
-                                Err(e) => error!(
-                                    context,
-                                    "couldn't load chat_id to inform user about SMTP error: {}", e
-                                ),
-                            };
                             Status::Finished(Err(format_err!("Permanent SMTP error: {}", err)))
                         }
                     }
-                    async_smtp::smtp::error::Error::Transient(_) => {
+                    async_smtp::smtp::error::Error::Transient(ref response) => {
                         // We got a transient 4xx response from SMTP server.
                         // Give some time until the server-side error maybe goes away.
-                        Status::RetryLater
+
+                        if let Some(first_word) = response.first_word() {
+                            if first_word.ends_with(".1.1")
+                                || first_word.ends_with(".1.2")
+                                || first_word.ends_with(".1.3")
+                            {
+                                // Sometimes we receive transient errors that should be permanent.
+                                // Any extended smtp status codes like x.1.1, x.1.2 or x.1.3 that we
+                                // receive as a transient error are misconfigurations of the smtp server.
+                                // See https://tools.ietf.org/html/rfc3463#section-3.2
+                                info!(context, "Smtp-job #{} Received extended status code {} for a transient error. This looks like a misconfigured smtp server, let's fail immediatly", self.job_id, first_word);
+                                Status::Finished(Err(format_err!("Permanent SMTP error: {}", err)))
+                            } else {
+                                Status::RetryLater
+                            }
+                        } else {
+                            Status::RetryLater
+                        }
                     }
                     _ => {
                         if smtp.has_maybe_stale_connection().await {
@@ -336,7 +340,14 @@ impl Job {
                 job_try!(success_cb().await);
                 Status::Finished(Ok(()))
             }
+        };
+
+        if let Status::Finished(Err(err)) = &status {
+            // We couldn't send the message, so mark it as failed
+            let msg_id = MsgId::new(self.foreign_id);
+            message::set_msg_failed(context, msg_id, Some(err.to_string())).await;
         }
+        status
     }
 
     pub(crate) async fn send_msg_to_smtp(&mut self, context: &Context, smtp: &mut Smtp) -> Status {
@@ -690,18 +701,21 @@ impl Job {
                     }
                     Ok(c) => c,
                 };
-                if chat.typ == Chattype::Group {
-                    // The next lines are actually what we do in
-                    let (test_normal_chat_id, test_normal_chat_id_blocked) =
-                        chat::lookup_by_contact_id(context, msg.from_id)
-                            .await
-                            .unwrap_or_default();
+                match chat.typ {
+                    Chattype::Group | Chattype::Mailinglist => {
+                        // The next lines are actually what we do in
+                        let (test_normal_chat_id, test_normal_chat_id_blocked) =
+                            chat::lookup_by_contact_id(context, msg.from_id)
+                                .await
+                                .unwrap_or_default();
 
-                    if !test_normal_chat_id.is_unset()
-                        && test_normal_chat_id_blocked == Blocked::Not
-                    {
-                        chat.id.unblock(context).await;
+                        if !test_normal_chat_id.is_unset()
+                            && test_normal_chat_id_blocked == Blocked::Not
+                        {
+                            chat.id.unblock(context).await;
+                        }
                     }
+                    Chattype::Single | Chattype::Undefined => {}
                 }
             }
         }
