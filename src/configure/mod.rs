@@ -19,7 +19,7 @@ use crate::message::Message;
 use crate::oauth2::dc_get_oauth2_addr;
 use crate::provider::{Protocol, Socket, UsernamePattern};
 use crate::smtp::Smtp;
-use crate::stock::StockMessage;
+use crate::stock_str;
 use crate::{chat, e2ee, provider};
 use crate::{config::Config, dc_tools::time};
 use crate::{
@@ -127,9 +127,10 @@ impl Context {
                     self,
                     0,
                     Some(
-                        self.stock_string_repl_str(
-                            StockMessage::ConfigurationFailed,
-                            // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
+                        stock_str::configuration_failed(
+                            self,
+                            // We are using Anyhow's .context() and to show the
+                            // inner error, too, we need the {:#}:
                             format!("{:#}", err),
                         )
                         .await
@@ -589,10 +590,7 @@ async fn nicer_configuration_error(context: &Context, errors: Vec<ConfigurationE
         .iter()
         .all(|e| e.msg.to_lowercase().contains("could not resolve"))
     {
-        return context
-            .stock_str(StockMessage::ErrorNoNetwork)
-            .await
-            .to_string();
+        return stock_str::error_no_network(context).await;
     }
 
     if errors.iter().all(|e| e.msg == first_err.msg) {

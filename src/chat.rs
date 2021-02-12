@@ -1,6 +1,5 @@
 //! # Chat module
 
-use deltachat_derive::{FromSql, ToSql};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -8,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context as _;
 use anyhow::{bail, ensure, format_err, Error};
 use async_std::path::{Path, PathBuf};
+use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
 use num_traits::FromPrimitive;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::sql;
-use crate::stock::StockMessage;
+use crate::stock_str;
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone)]
@@ -396,12 +396,7 @@ impl ChatId {
 
         if chat.is_self_talk() {
             let mut msg = Message::new(Viewtype::Text);
-            msg.text = Some(
-                context
-                    .stock_str(StockMessage::SelfDeletedMsgBody)
-                    .await
-                    .into(),
-            );
+            msg.text = Some(stock_str::self_deleted_msg_body(context).await);
             add_device_msg(&context, None, Some(&mut msg)).await?;
         }
 
@@ -659,23 +654,23 @@ impl ChatId {
             let addr = contact.get_addr();
             let peerstate = Peerstate::from_addr(context, addr).await?;
 
-            let stock_message = peerstate
+            let stock_message = match peerstate
                 .filter(|peerstate| {
                     peerstate
                         .peek_key(PeerstateVerifiedStatus::Unverified)
                         .is_some()
                 })
-                .map(|peerstate| match peerstate.prefer_encrypt {
-                    EncryptPreference::Mutual => StockMessage::E2ePreferred,
-                    EncryptPreference::NoPreference => StockMessage::E2eAvailable,
-                    EncryptPreference::Reset => StockMessage::EncrNone,
-                })
-                .unwrap_or(StockMessage::EncrNone);
-
+                .map(|peerstate| peerstate.prefer_encrypt)
+            {
+                Some(EncryptPreference::Mutual) => stock_str::e2e_preferred(context).await,
+                Some(EncryptPreference::NoPreference) => stock_str::e2e_available(context).await,
+                Some(EncryptPreference::Reset) => stock_str::encr_none(context).await,
+                None => stock_str::encr_none(context).await,
+            };
             if !ret.is_empty() {
                 ret.push('\n')
             }
-            ret += &format!("{} {}", addr, context.stock_str(stock_message).await);
+            ret += &format!("{} {}", addr, stock_message);
         }
 
         Ok(ret)
@@ -793,9 +788,9 @@ impl Chat {
             }
             Ok(mut chat) => {
                 if chat.id.is_deaddrop() {
-                    chat.name = context.stock_str(StockMessage::DeadDrop).await.into();
+                    chat.name = stock_str::dead_drop(context).await;
                 } else if chat.id.is_archived_link() {
-                    let tempname = context.stock_str(StockMessage::ArchivedChats).await;
+                    let tempname = stock_str::archived_chats(context).await;
                     let cnt = dc_get_archived_cnt(context).await;
                     chat.name = format!("{} ({})", tempname, cnt);
                 } else {
@@ -810,9 +805,9 @@ impl Chat {
                         chat.name = chat_name;
                     }
                     if chat.param.exists(Param::Selftalk) {
-                        chat.name = context.stock_str(StockMessage::SavedMessages).await.into();
+                        chat.name = stock_str::saved_messages(context).await;
                     } else if chat.param.exists(Param::Devicetalk) {
-                        chat.name = context.stock_str(StockMessage::DeviceMessages).await.into();
+                        chat.name = stock_str::device_messages(context).await;
                     }
                 }
                 Ok(chat)
@@ -1411,10 +1406,9 @@ pub(crate) async fn update_device_icon(context: &Context) -> Result<(), Error> {
 async fn update_special_chat_name(
     context: &Context,
     contact_id: u32,
-    stock_id: StockMessage,
+    name: String,
 ) -> Result<(), Error> {
     if let Ok((chat_id, _)) = lookup_by_contact_id(context, contact_id).await {
-        let name: String = context.stock_str(stock_id).await.into();
         // the `!= name` condition avoids unneeded writes
         context
             .sql
@@ -1428,8 +1422,18 @@ async fn update_special_chat_name(
 }
 
 pub(crate) async fn update_special_chat_names(context: &Context) -> Result<(), Error> {
-    update_special_chat_name(context, DC_CONTACT_ID_DEVICE, StockMessage::DeviceMessages).await?;
-    update_special_chat_name(context, DC_CONTACT_ID_SELF, StockMessage::SavedMessages).await?;
+    update_special_chat_name(
+        context,
+        DC_CONTACT_ID_DEVICE,
+        stock_str::device_messages(context).await,
+    )
+    .await?;
+    update_special_chat_name(
+        context,
+        DC_CONTACT_ID_SELF,
+        stock_str::saved_messages(context).await,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1812,11 +1816,7 @@ pub async fn send_videochat_invitation(context: &Context, chat_id: ChatId) -> Re
     let mut msg = Message::new(Viewtype::VideochatInvitation);
     msg.param.set(Param::WebrtcRoom, &instance);
     msg.text = Some(
-        context
-            .stock_string_repl_str(
-                StockMessage::VideochatInviteMsgBody,
-                Message::parse_webrtc_instance(&instance).1,
-            )
+        stock_str::videochat_invite_msg_body(context, Message::parse_webrtc_instance(&instance).1)
             .await,
     );
     send_msg(context, chat_id, &mut msg).await
@@ -2154,9 +2154,7 @@ pub async fn create_group_chat(
     let chat_name = improve_single_line_input(chat_name);
     ensure!(!chat_name.is_empty(), "Invalid chat name");
 
-    let draft_txt = context
-        .stock_string_repl_str(StockMessage::NewGroupDraft, &chat_name)
-        .await;
+    let draft_txt = stock_str::new_group_draft(context, &chat_name).await;
     let grpid = dc_create_id();
 
     context.sql.execute(
@@ -2333,16 +2331,8 @@ pub(crate) async fn add_contact_to_chat_ex(
     }
     if chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 0 {
         msg.viewtype = Viewtype::Text;
-        msg.text = Some(
-            context
-                .stock_system_msg(
-                    StockMessage::MsgAddMember,
-                    contact.get_addr(),
-                    "",
-                    DC_CONTACT_ID_SELF as u32,
-                )
-                .await,
-        );
+        msg.text =
+            Some(stock_str::msg_add_member(context, contact.get_addr(), DC_CONTACT_ID_SELF).await);
         msg.param.set_cmd(SystemMessage::MemberAddedToGroup);
         msg.param.set(Param::Arg, contact.get_addr());
         msg.param.set_int(Param::Arg2, from_handshake.into());
@@ -2536,26 +2526,16 @@ pub async fn remove_contact_from_chat(
                         msg.viewtype = Viewtype::Text;
                         if contact.id == DC_CONTACT_ID_SELF {
                             set_group_explicitly_left(context, chat.grpid).await?;
-                            msg.text = Some(
-                                context
-                                    .stock_system_msg(
-                                        StockMessage::MsgGroupLeft,
-                                        "",
-                                        "",
-                                        DC_CONTACT_ID_SELF,
-                                    )
-                                    .await,
-                            );
+                            msg.text =
+                                Some(stock_str::msg_group_left(context, DC_CONTACT_ID_SELF).await);
                         } else {
                             msg.text = Some(
-                                context
-                                    .stock_system_msg(
-                                        StockMessage::MsgDelMember,
-                                        contact.get_addr(),
-                                        "",
-                                        DC_CONTACT_ID_SELF,
-                                    )
-                                    .await,
+                                stock_str::msg_del_member(
+                                    context,
+                                    contact.get_addr(),
+                                    DC_CONTACT_ID_SELF,
+                                )
+                                .await,
                             );
                         }
                         msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
@@ -2651,13 +2631,7 @@ pub async fn set_chat_name(
                 if chat.is_promoted() && !chat.is_mailing_list() {
                     msg.viewtype = Viewtype::Text;
                     msg.text = Some(
-                        context
-                            .stock_system_msg(
-                                StockMessage::MsgGrpName,
-                                &chat.name,
-                                &new_name,
-                                DC_CONTACT_ID_SELF,
-                            )
+                        stock_str::msg_grp_name(context, &chat.name, &new_name, DC_CONTACT_ID_SELF)
                             .await,
                     );
                     msg.param.set_cmd(SystemMessage::GroupNameChanged);
@@ -2715,11 +2689,7 @@ pub async fn set_chat_profile_image(
     if new_image.as_ref().is_empty() {
         chat.param.remove(Param::ProfileImage);
         msg.param.remove(Param::Arg);
-        msg.text = Some(
-            context
-                .stock_system_msg(StockMessage::MsgGrpImgDeleted, "", "", DC_CONTACT_ID_SELF)
-                .await,
-        );
+        msg.text = Some(stock_str::msg_grp_img_deleted(context, DC_CONTACT_ID_SELF).await);
     } else {
         let image_blob = match BlobObject::from_path(context, Path::new(new_image.as_ref())) {
             Ok(blob) => Ok(blob),
@@ -2733,11 +2703,7 @@ pub async fn set_chat_profile_image(
         image_blob.recode_to_avatar_size(context).await?;
         chat.param.set(Param::ProfileImage, image_blob.as_name());
         msg.param.set(Param::Arg, image_blob.as_name());
-        msg.text = Some(
-            context
-                .stock_system_msg(StockMessage::MsgGrpImgChanged, "", "", DC_CONTACT_ID_SELF)
-                .await,
-        );
+        msg.text = Some(stock_str::msg_grp_img_changed(context, DC_CONTACT_ID_SELF).await);
     }
     chat.update_param(context).await?;
     if chat.is_promoted() && !chat.is_mailing_list() {
@@ -3215,7 +3181,7 @@ mod tests {
         assert!(chat.visibility == ChatVisibility::Normal);
         assert!(!chat.is_device_talk());
         assert!(chat.can_send());
-        assert_eq!(chat.name, t.stock_str(StockMessage::SavedMessages).await);
+        assert_eq!(chat.name, stock_str::saved_messages(&t).await);
         assert!(chat.get_profile_image(&t).await.is_some());
     }
 
@@ -3231,7 +3197,7 @@ mod tests {
         assert!(chat.visibility == ChatVisibility::Normal);
         assert!(!chat.is_device_talk());
         assert!(!chat.can_send());
-        assert_eq!(chat.name, t.stock_str(StockMessage::DeadDrop).await);
+        assert_eq!(chat.name, stock_str::dead_drop(&t).await);
     }
 
     #[async_std::test]
@@ -3308,7 +3274,7 @@ mod tests {
         assert!(chat.is_device_talk());
         assert!(!chat.is_self_talk());
         assert!(!chat.can_send());
-        assert_eq!(chat.name, t.stock_str(StockMessage::DeviceMessages).await);
+        assert_eq!(chat.name, stock_str::device_messages(&t).await);
         assert!(chat.get_profile_image(&t).await.is_some());
 
         // delete device message, make sure it is not added again
@@ -3817,5 +3783,54 @@ mod tests {
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionEnabled);
         assert_eq!(msg.get_state(), MessageState::OutDelivered); // as bcc-self is disabled and there is nobody else in the chat
+    }
+
+    #[async_std::test]
+    async fn test_lookup_by_contact_id() {
+        let ctx = TestContext::new_alice().await;
+
+        // create contact, then unblocked chat
+        let contact_id = Contact::create(&ctx, "", "bob@foo.de").await.unwrap();
+        assert_ne!(contact_id, 0);
+        let res = lookup_by_contact_id(&ctx, contact_id).await;
+        assert!(res.is_err());
+
+        let chat_id = create_by_contact_id(&ctx, contact_id).await.unwrap();
+        let (chat_id2, blocked) = lookup_by_contact_id(&ctx, contact_id).await.unwrap();
+        assert_eq!(chat_id, chat_id2);
+        assert_eq!(blocked, Blocked::Not);
+
+        // create contact, then blocked chat
+        let contact_id = Contact::create(&ctx, "", "claire@foo.de").await.unwrap();
+        let (chat_id, _) = create_or_lookup_by_contact_id(&ctx, contact_id, Blocked::Manually)
+            .await
+            .unwrap();
+        let (chat_id2, blocked) = lookup_by_contact_id(&ctx, contact_id).await.unwrap();
+        assert_eq!(chat_id, chat_id2);
+        assert_eq!(blocked, Blocked::Manually);
+
+        // test nonexistent contact, and also check if reasonable defaults are used
+        let res = lookup_by_contact_id(&ctx, 1234).await;
+        assert!(res.is_err());
+
+        let (chat_id, blocked) = lookup_by_contact_id(&ctx, 1234).await.unwrap_or_default();
+        assert_eq!(chat_id, ChatId::new(0));
+        assert_eq!(blocked, Blocked::Not);
+    }
+
+    #[async_std::test]
+    async fn test_lookup_self_by_contact_id() {
+        let ctx = TestContext::new_alice().await;
+
+        let res = lookup_by_contact_id(&ctx, DC_CONTACT_ID_SELF).await;
+        assert!(res.is_err());
+
+        ctx.update_device_chats().await.unwrap();
+        let (chat_id, blocked) = lookup_by_contact_id(&ctx, DC_CONTACT_ID_SELF)
+            .await
+            .unwrap();
+        assert!(!chat_id.is_special());
+        assert!(chat_id.is_self_talk(&ctx).await.unwrap());
+        assert_eq!(blocked, Blocked::Not);
     }
 }

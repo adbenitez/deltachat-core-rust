@@ -14,7 +14,7 @@ use crate::job::{self, Job};
 use crate::message::{Message, MsgId};
 use crate::mimeparser::SystemMessage;
 use crate::param::Params;
-use crate::stock::StockMessage;
+use crate::stock_str;
 
 /// Location record
 #[derive(Debug, Clone, Default)]
@@ -193,7 +193,8 @@ impl Kml {
 pub async fn send_locations_to_chat(context: &Context, chat_id: ChatId, seconds: i64) {
     let now = time();
     if !(seconds < 0 || chat_id.is_special()) {
-        let is_sending_locations_before = is_sending_locations_to_chat(context, chat_id).await;
+        let is_sending_locations_before =
+            is_sending_locations_to_chat(context, Some(chat_id)).await;
         if context
             .sql
             .execute(
@@ -212,19 +213,13 @@ pub async fn send_locations_to_chat(context: &Context, chat_id: ChatId, seconds:
         {
             if 0 != seconds && !is_sending_locations_before {
                 let mut msg = Message::new(Viewtype::Text);
-                msg.text = Some(
-                    context
-                        .stock_system_msg(StockMessage::MsgLocationEnabled, "", "", 0)
-                        .await,
-                );
+                msg.text = Some(stock_str::msg_location_enabled(context).await);
                 msg.param.set_cmd(SystemMessage::LocationStreamingEnabled);
                 chat::send_msg(context, chat_id, &mut msg)
                     .await
                     .unwrap_or_default();
             } else if 0 == seconds && is_sending_locations_before {
-                let stock_str = context
-                    .stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0)
-                    .await;
+                let stock_str = stock_str::msg_location_disabled(context).await;
                 chat::add_info_msg(context, chat_id, stock_str).await;
             }
             context.emit_event(EventType::ChatModified(chat_id));
@@ -255,15 +250,29 @@ async fn schedule_maybe_send_locations(context: &Context, force_schedule: bool) 
     };
 }
 
-pub async fn is_sending_locations_to_chat(context: &Context, chat_id: ChatId) -> bool {
-    context
-        .sql
-        .exists(
-            "SELECT id  FROM chats  WHERE (? OR id=?)   AND locations_send_until>?;",
-            paramsv![if chat_id.is_unset() { 1 } else { 0 }, chat_id, time()],
-        )
-        .await
-        .unwrap_or_default()
+/// Returns whether `chat_id` or any chat is sending locations.
+///
+/// If `chat_id` is `Some` only that chat is checked, otherwise returns `true` if any chat
+/// is sending locations.
+pub async fn is_sending_locations_to_chat(context: &Context, chat_id: Option<ChatId>) -> bool {
+    match chat_id {
+        Some(chat_id) => context
+            .sql
+            .exists(
+                "SELECT id  FROM chats  WHERE id=?  AND locations_send_until>?;",
+                paramsv![chat_id, time()],
+            )
+            .await
+            .unwrap_or_default(),
+        None => context
+            .sql
+            .exists(
+                "SELECT id  FROM chats  WHERE locations_send_until>?;",
+                paramsv![time()],
+            )
+            .await
+            .unwrap_or_default(),
+    }
 }
 
 pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64) -> bool {
@@ -311,14 +320,22 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
 
 pub async fn get_range(
     context: &Context,
-    chat_id: ChatId,
-    contact_id: u32,
+    chat_id: Option<ChatId>,
+    contact_id: Option<u32>,
     timestamp_from: i64,
     mut timestamp_to: i64,
 ) -> Vec<Location> {
     if timestamp_to == 0 {
         timestamp_to = time() + 10;
     }
+    let (disable_chat_id, chat_id) = match chat_id {
+        Some(chat_id) => (0, chat_id),
+        None => (1, ChatId::new(0)), // this ChatId is unused
+    };
+    let (disable_contact_id, contact_id) = match contact_id {
+        Some(contact_id) => (0, contact_id),
+        None => (1, 0), // this contact_id is unused
+    };
     context
         .sql
         .query_map(
@@ -329,9 +346,9 @@ pub async fn get_range(
              AND (l.independent=1 OR (l.timestamp>=? AND l.timestamp<=?)) \
              ORDER BY l.timestamp DESC, l.id DESC, msg_id DESC;",
             paramsv![
-                if chat_id.is_unset() { 1 } else { 0 },
+                disable_chat_id,
                 chat_id,
-                if contact_id == 0 { 1 } else { 0 },
+                disable_contact_id,
                 contact_id as i32,
                 timestamp_from,
                 timestamp_to,
@@ -716,9 +733,7 @@ pub(crate) async fn job_maybe_send_locations_ended(
                 paramsv![chat_id],
             ).await);
 
-            let stock_str = context
-                .stock_system_msg(StockMessage::MsgLocationDisabled, "", "", 0)
-                .await;
+            let stock_str = stock_str::msg_location_disabled(context).await;
             chat::add_info_msg(context, chat_id, stock_str).await;
             context.emit_event(EventType::ChatModified(chat_id));
         }

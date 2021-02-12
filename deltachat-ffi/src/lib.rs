@@ -32,7 +32,7 @@ use deltachat::context::Context;
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::key::DcKey;
 use deltachat::message::MsgId;
-use deltachat::stock::StockMessage;
+use deltachat::stock_str::StockMessage;
 use deltachat::*;
 
 mod dc_array;
@@ -1943,11 +1943,13 @@ pub unsafe extern "C" fn dc_is_sending_locations_to_chat(
         return 0;
     }
     let ctx = &*context;
+    let chat_id = if chat_id == 0 {
+        None
+    } else {
+        Some(ChatId::new(chat_id))
+    };
 
-    block_on(location::is_sending_locations_to_chat(
-        &ctx,
-        ChatId::new(chat_id),
-    )) as libc::c_int
+    block_on(location::is_sending_locations_to_chat(&ctx, chat_id)) as libc::c_int
 }
 
 #[no_mangle]
@@ -1979,11 +1981,21 @@ pub unsafe extern "C" fn dc_get_locations(
         return ptr::null_mut();
     }
     let ctx = &*context;
+    let chat_id = if chat_id == 0 {
+        None
+    } else {
+        Some(ChatId::new(chat_id))
+    };
+    let contact_id = if contact_id == 0 {
+        None
+    } else {
+        Some(contact_id)
+    };
 
     block_on(async move {
         let res = location::get_range(
             &ctx,
-            ChatId::new(chat_id),
+            chat_id,
             contact_id,
             timestamp_begin as i64,
             timestamp_end as i64,
@@ -3218,6 +3230,16 @@ pub unsafe extern "C" fn dc_contact_get_name(contact: *mut dc_contact_t) -> *mut
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_name().strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_contact_get_auth_name(contact: *mut dc_contact_t) -> *mut libc::c_char {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_get_auth_name()");
+        return "".strdup();
+    }
+    let ffi_contact = &*contact;
+    ffi_contact.contact.get_authname().strdup()
 }
 
 #[no_mangle]

@@ -26,7 +26,7 @@ use crate::lot::{Lot, LotState, Meaning};
 use crate::mimeparser::{FailureReport, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
-use crate::stock::StockMessage;
+use crate::stock_str;
 use std::collections::BTreeMap;
 
 // In practice, the user additionally cuts the string themselves
@@ -877,7 +877,13 @@ impl Message {
         if self.param.get(Param::Quote).is_some() {
             if let Some(in_reply_to) = &self.in_reply_to {
                 if let Some((_, _, msg_id)) = rfc724_mid_exists(context, in_reply_to).await? {
-                    return Ok(Some(Message::load_from_db(context, msg_id).await?));
+                    let msg = Message::load_from_db(context, msg_id).await?;
+                    return if msg.chat_id.is_trash() {
+                        // If message is already moved to trash chat, pretend it does not exist.
+                        Ok(None)
+                    } else {
+                        Ok(Some(msg))
+                    };
                 }
             }
         }
@@ -1049,26 +1055,14 @@ impl Lot {
         context: &Context,
     ) {
         if msg.state == MessageState::OutDraft {
-            self.text1 = Some(
-                context
-                    .stock_str(StockMessage::Draft)
-                    .await
-                    .to_owned()
-                    .into(),
-            );
+            self.text1 = Some(stock_str::draft(context).await);
             self.text1_meaning = Meaning::Text1Draft;
         } else if msg.from_id == DC_CONTACT_ID_SELF {
             if msg.is_info() || chat.is_self_talk() {
                 self.text1 = None;
                 self.text1_meaning = Meaning::None;
             } else {
-                self.text1 = Some(
-                    context
-                        .stock_str(StockMessage::SelfMsg)
-                        .await
-                        .to_owned()
-                        .into(),
-                );
+                self.text1 = Some(stock_str::self_msg(context).await);
                 self.text1_meaning = Meaning::Text1Self;
             }
         } else {
@@ -1101,10 +1095,7 @@ impl Lot {
         .await;
 
         if text2.is_empty() && msg.quoted_text().is_some() {
-            text2 = context
-                .stock_str(StockMessage::ReplyNoun)
-                .await
-                .into_owned()
+            text2 = stock_str::reply_noun(context).await
         }
 
         self.text2 = Some(text2);
@@ -1556,21 +1547,15 @@ pub async fn get_summarytext_by_raw(
 ) -> String {
     let mut append_text = true;
     let prefix = match viewtype {
-        Viewtype::Image => context.stock_str(StockMessage::Image).await.into_owned(),
-        Viewtype::Gif => context.stock_str(StockMessage::Gif).await.into_owned(),
-        Viewtype::Sticker => context.stock_str(StockMessage::Sticker).await.into_owned(),
-        Viewtype::Video => context.stock_str(StockMessage::Video).await.into_owned(),
-        Viewtype::Voice => context
-            .stock_str(StockMessage::VoiceMessage)
-            .await
-            .into_owned(),
+        Viewtype::Image => stock_str::image(context).await,
+        Viewtype::Gif => stock_str::gif(context).await,
+        Viewtype::Sticker => stock_str::sticker(context).await,
+        Viewtype::Video => stock_str::video(context).await,
+        Viewtype::Voice => stock_str::voice_message(context).await,
         Viewtype::Audio | Viewtype::File => {
             if param.get_cmd() == SystemMessage::AutocryptSetupMessage {
                 append_text = false;
-                context
-                    .stock_str(StockMessage::AcSetupMsgSubject)
-                    .await
-                    .to_string()
+                stock_str::ac_setup_msg_subject(context).await
             } else {
                 let file_name: String = param
                     .get_path(Param::File, context)
@@ -1580,29 +1565,24 @@ pub async fn get_summarytext_by_raw(
                             .map(|fname| fname.to_string_lossy().into_owned())
                     })
                     .unwrap_or_else(|| String::from("ErrFileName"));
-                let label = context
-                    .stock_str(if viewtype == Viewtype::Audio {
-                        StockMessage::Audio
-                    } else {
-                        StockMessage::File
-                    })
-                    .await;
+                let label = if viewtype == Viewtype::Audio {
+                    stock_str::audio(context).await
+                } else {
+                    stock_str::file(context).await
+                };
                 format!("{} – {}", label, file_name)
             }
         }
         Viewtype::VideochatInvitation => {
             append_text = false;
-            context
-                .stock_str(StockMessage::VideochatInvitation)
-                .await
-                .into_owned()
+            stock_str::videochat_invitation(context).await
         }
         _ => {
             if param.get_cmd() != SystemMessage::LocationOnly {
                 "".to_string()
             } else {
                 append_text = false;
-                context.stock_str(StockMessage::Location).await.to_string()
+                stock_str::location(context).await
             }
         }
     };
@@ -1859,13 +1839,9 @@ async fn ndn_maybe_add_info_msg(
                             Error::msg("ndn_maybe_add_info_msg: Contact ID not found")
                         })?;
                 let contact = Contact::load_from_db(context, contact_id).await?;
-                // Tell the user which of the recipients failed if we know that (because in a group, this might otherwise be unclear)
-                let text = context
-                    .stock_string_repl_str(
-                        StockMessage::FailedSendingTo,
-                        contact.get_display_name(),
-                    )
-                    .await;
+                // Tell the user which of the recipients failed if we know that (because in
+                // a group, this might otherwise be unclear)
+                let text = stock_str::failed_sending_to(context, contact.get_display_name()).await;
                 chat::add_info_msg(context, chat_id, text).await;
                 context.emit_event(EventType::ChatModified(chat_id));
             }
