@@ -9,15 +9,14 @@ use regex::Regex;
 
 use crate::aheader::EncryptPreference;
 use crate::chat::ChatId;
+use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
     Chattype, DC_CHAT_ID_DEADDROP, DC_CONTACT_ID_DEVICE, DC_CONTACT_ID_DEVICE_ADDR,
     DC_CONTACT_ID_LAST_SPECIAL, DC_CONTACT_ID_SELF, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY,
 };
 use crate::context::Context;
-use crate::dc_tools::{
-    dc_get_abs_path, dc_str_to_color, improve_single_line_input, listflags_has, EmailAddress,
-};
+use crate::dc_tools::{dc_get_abs_path, improve_single_line_input, listflags_has, EmailAddress};
 use crate::events::EventType;
 use crate::key::{DcKey, SignedPublicKey};
 use crate::login_param::LoginParam;
@@ -947,7 +946,7 @@ impl Contact {
     /// and can be used for an fallback avatar with white initials
     /// as well as for headlines in bubbles of group chats.
     pub fn get_color(&self) -> u32 {
-        dc_str_to_color(&self.addr)
+        str_to_color(&self.addr)
     }
 
     /// Gets the contact's status.
@@ -1329,7 +1328,7 @@ mod tests {
     #[test]
     fn test_split_address_book() {
         let book = "Name one\nAddress one\nName two\nAddress two\nrest name";
-        let list = split_address_book(&book);
+        let list = split_address_book(book);
         assert_eq!(
             list,
             vec![("Name one", "Address one"), ("Name two", "Address two")]
