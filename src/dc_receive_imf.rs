@@ -22,7 +22,9 @@ use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::job::{self, Action};
 use crate::message::{self, rfc724_mid_exists, Message, MessageState, MessengerMessage, MsgId};
-use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
+use crate::mimeparser::{
+    parse_message_ids, AvatarAction, MailinglistType, MimeMessage, SystemMessage,
+};
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
@@ -103,8 +105,6 @@ pub(crate) async fn dc_receive_imf_inner(
     let mut created_db_entries = Vec::new();
     let mut create_event_to_send = Some(CreateEvent::MsgsChanged);
 
-    let list_id_header: Option<&String> = mime_parser.get(HeaderDef::ListId);
-
     // helper method to handle early exit and memory cleanup
     let cleanup = |context: &Context,
                    create_event_to_send: &Option<CreateEvent>,
@@ -125,7 +125,8 @@ pub(crate) async fn dc_receive_imf_inner(
         sent_timestamp = mailparse::dateparse(value).unwrap_or_default();
     }
 
-    let prevent_rename = list_id_header.is_some() || mime_parser.get(HeaderDef::Sender).is_some();
+    let prevent_rename =
+        mime_parser.is_mailinglist_message() || mime_parser.get(HeaderDef::Sender).is_some();
 
     // get From: (it can be an address list!) and check if it is known (for known From:'s we add
     // the other To:/Cc: in the 3rd pass)
@@ -521,27 +522,34 @@ async fn add_parts(
 
         if chat_id.is_unset() {
             // check if the message belongs to a mailing list
-            if let Some(list_id_header) = mime_parser.get(HeaderDef::ListId) {
-                let create_blocked = Blocked::Deaddrop;
-
-                let (new_chat_id, new_chat_id_blocked) = create_or_lookup_mailinglist(
-                    context,
-                    allow_creation,
-                    create_blocked,
-                    list_id_header,
-                    &mime_parser.get_subject().unwrap_or_default(),
-                )
-                .await;
-
-                *chat_id = new_chat_id;
-                chat_id_blocked = new_chat_id_blocked;
-                if let Some(from) = mime_parser.from.first() {
-                    if let Some(from_name) = &from.display_name {
-                        for part in mime_parser.parts.iter_mut() {
-                            part.param.set(Param::OverrideSenderDisplayname, from_name);
-                        }
+            match mime_parser.get_mailinglist_type() {
+                MailinglistType::ListIdBased => {
+                    if let Some(list_id) = mime_parser.get(HeaderDef::ListId) {
+                        let (new_chat_id, new_chat_id_blocked) = create_or_lookup_mailinglist(
+                            context,
+                            allow_creation,
+                            list_id,
+                            mime_parser,
+                        )
+                        .await;
+                        *chat_id = new_chat_id;
+                        chat_id_blocked = new_chat_id_blocked;
                     }
                 }
+                MailinglistType::SenderBased => {
+                    if let Some(sender) = mime_parser.get(HeaderDef::Sender) {
+                        let (new_chat_id, new_chat_id_blocked) = create_or_lookup_mailinglist(
+                            context,
+                            allow_creation,
+                            sender,
+                            mime_parser,
+                        )
+                        .await;
+                        *chat_id = new_chat_id;
+                        chat_id_blocked = new_chat_id_blocked;
+                    }
+                }
+                MailinglistType::None => {}
             }
         }
 
@@ -1483,13 +1491,21 @@ async fn create_or_lookup_group(
     Ok((chat_id, chat_id_blocked))
 }
 
+/// Create or lookup a mailing list chat.
+///
+/// `list_id_header` contains the Id that must be used for the mailing list
+/// and has the form `Name <Id>`, `<Id>` or just `Id`.
+/// Depending on the mailing list type, `list_id_header`
+/// was picked from `ListId:`-header or the `Sender:`-header.
+///
+/// `mime_parser` is the corresponding message
+/// and is used to figure out the mailing list name from different header fields.
 #[allow(clippy::indexing_slicing)]
 async fn create_or_lookup_mailinglist(
     context: &Context,
     allow_creation: bool,
-    create_blocked: Blocked,
     list_id_header: &str,
-    subject: &str,
+    mime_parser: &MimeMessage,
 ) -> (ChatId, Blocked) {
     static LIST_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(.+)<(.+)>$").unwrap());
     let (mut name, listid) = match LIST_ID.captures(list_id_header) {
@@ -1508,8 +1524,23 @@ async fn create_or_lookup_mailinglist(
         return (chat_id, blocked);
     }
 
+    // for mailchimp lists, the name in `ListId` is just a long number.
+    // a usable name for these lists is in the `From` header
+    // and we can detect these lists by a unique `ListId`-suffix.
+    if listid.ends_with(".list-id.mcsv.net") {
+        if let Some(from) = mime_parser.from.first() {
+            if let Some(display_name) = &from.display_name {
+                name = display_name.clone();
+            }
+        }
+    }
+
+    // if we have an additional name square brackets in the subject, we prefer that
+    // (as that part is much more visible, we assume, that names is shorter and comes more to the point,
+    // than the sometimes longer part from ListId)
+    let subject = mime_parser.get_subject().unwrap_or_default();
     static SUBJECT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^.{0,5}\[(.*.)\]").unwrap());
-    if let Some(cap) = SUBJECT.captures(subject) {
+    if let Some(cap) = SUBJECT.captures(&subject) {
         name = cap[1].to_string();
     }
 
@@ -1524,14 +1555,14 @@ async fn create_or_lookup_mailinglist(
             Chattype::Mailinglist,
             &listid,
             &name,
-            create_blocked,
+            Blocked::Deaddrop,
             ProtectionStatus::Unprotected,
         )
         .await
         {
             Ok(chat_id) => {
                 chat::add_to_chat_contacts_table(context, chat_id, DC_CONTACT_ID_SELF).await;
-                (chat_id, create_blocked)
+                (chat_id, Blocked::Deaddrop)
             }
             Err(e) => {
                 warn!(
@@ -1541,7 +1572,7 @@ async fn create_or_lookup_mailinglist(
                     &listid,
                     e.to_string()
                 );
-                (ChatId::new(0), create_blocked)
+                (ChatId::new(0), Blocked::Deaddrop)
             }
         }
     } else {
@@ -1987,7 +2018,7 @@ mod tests {
     use crate::chatlist::Chatlist;
     use crate::constants::{DC_CHAT_ID_DEADDROP, DC_CONTACT_ID_INFO, DC_GCL_NO_SPECIALS};
     use crate::message::ContactRequestDecision::*;
-    use crate::message::Message;
+    use crate::message::{ContactRequestDecision, Message};
     use crate::test_utils::{get_chat_msg, TestContext};
 
     #[test]
@@ -2890,6 +2921,94 @@ mod tests {
 
         let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0, None).await;
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[async_std::test]
+    async fn test_majordomo_mailing_list() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+
+        // test mailing lists not having a `ListId:`-header
+        dc_receive_imf(
+            &t,
+            b"From: Foo Bar <foo@bar.org>\n\
+    To: deltachat/deltachat-core-rust <deltachat-core-rust@noreply.github.com>\n\
+    Subject: [ola] just a subject\n\
+    Message-ID: <3333@example.org>\n\
+    Sender: My list <mylist@bar.org>\n\
+    Precedence: list\n\
+    Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
+    \n\
+    hello\n",
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        let chat_id =
+            message::decide_on_contact_request(&t, msg.id, ContactRequestDecision::StartChat)
+                .await
+                .unwrap();
+        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.grpid, "mylist@bar.org");
+        assert_eq!(chat.name, "ola");
+        assert_eq!(chat::get_chat_msgs(&t, chat.id, 0, None).await.len(), 1);
+
+        // receive another message with no sender name but the same address,
+        // make sure this lands in the same chat
+        dc_receive_imf(
+            &t,
+            b"From: Nu Bar <nu@bar.org>\n\
+    To: deltachat/deltachat-core-rust <deltachat-core-rust@noreply.github.com>\n\
+    Subject: [ola] Re: just a subject\n\
+    Message-ID: <4444@example.org>\n\
+    Sender: mylist@bar.org\n\
+    Precedence: list\n\
+    Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
+    \n\
+    hello\n",
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chat::get_chat_msgs(&t, chat.id, 0, None).await.len(), 2);
+    }
+
+    #[async_std::test]
+    async fn test_mailchimp_mailing_list() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+
+        dc_receive_imf(
+            &t,
+            b"To: alice <alice@example.org>\n\
+            Subject: =?utf-8?Q?How=20early=20megacities=20emerged=20from=20Cambodia=E2=80=99s=20jungles?=\n\
+            From: =?utf-8?Q?Atlas=20Obscura?= <info@atlasobscura.com>\n\
+            List-ID: 399fc0402f1b154b67965632emc list <399fc0402f1b154b67965632e.100761.list-id.mcsv.net>\n\
+            Message-ID: <555@example.org>\n\
+            Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
+            \n\
+            hello\n",
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.blocked, Blocked::Deaddrop);
+        assert_eq!(
+            chat.grpid,
+            "399fc0402f1b154b67965632e.100761.list-id.mcsv.net"
+        );
+        assert_eq!(chat.name, "Atlas Obscura");
     }
 
     #[async_std::test]
