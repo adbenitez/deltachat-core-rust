@@ -278,7 +278,7 @@ impl<'a> MimeFactory<'a> {
         }
     }
 
-    async fn should_force_plaintext(&self) -> bool {
+    async fn should_force_plaintext(&self, context: &Context) -> bool {
         match &self.loaded {
             Loaded::Message { chat } => {
                 if chat.is_protected() {
@@ -288,7 +288,7 @@ impl<'a> MimeFactory<'a> {
                         .param
                         .get_bool(Param::ForcePlaintext)
                         .unwrap_or_default()
-			|| (!self.context.get_config_bool(Config::E2eeEnabled).await
+			|| (!context.get_config_bool(Config::E2eeEnabled).await
 			    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default())
                 }
             }
@@ -296,14 +296,14 @@ impl<'a> MimeFactory<'a> {
         }
     }
 
-    async fn should_skip_autocrypt(&self) -> bool {
+    async fn should_skip_autocrypt(&self, context: &Context) -> bool {
         match &self.loaded {
             Loaded::Message { .. } => self
                 .msg
                 .param
                 .get_bool(Param::SkipAutocrypt)
                 .unwrap_or_default()
-		|| (!self.context.get_config_bool(Config::E2eeEnabled).await
+		|| (!context.get_config_bool(Config::E2eeEnabled).await
 		    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()),
             Loaded::MDN { .. } => true,
         }
@@ -474,8 +474,8 @@ impl<'a> MimeFactory<'a> {
 
         let min_verified = self.min_verified();
         let grpimage = self.grpimage();
-        let force_plaintext = self.should_force_plaintext().await;
-        let skip_autocrypt = self.should_skip_autocrypt().await;
+        let force_plaintext = self.should_force_plaintext(context).await;
+        let skip_autocrypt = self.should_skip_autocrypt(context).await;
         let subject_str = self.subject_str(context).await;
         let e2ee_guaranteed = self.is_e2ee_guaranteed();
         let encrypt_helper = EncryptHelper::new(context).await?;
