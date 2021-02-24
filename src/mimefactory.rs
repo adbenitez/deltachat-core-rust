@@ -511,12 +511,6 @@ impl<'a> MimeFactory<'a> {
             ));
         }
 
-        // we could also store the message-id in the protected headers
-        // which would probably help to survive providers like
-        // Outlook.com or hotmail which mangle the Message-ID.
-        // but they also strip the Autocrypt header so we probably
-        // never get a chance to tunnel our protected headers in a
-        // cryptographic payload.
         unprotected_headers.push(Header::new(
             "Message-ID".into(),
             render_rfc724_mid(&rfc724_mid),
@@ -1614,5 +1608,57 @@ mod tests {
         let _mime_msg = MimeMessage::from_bytes(context, &rendered_msg.message)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_no_empty_lines_in_header() {
+        // See https://github.com/deltachat/deltachat-core-rust/issues/2118
+        let to_tuples = [
+            ("Nnnn", "nnn@ttttttttt.de"),
+            ("😀 ttttttt", "ttttttt@rrrrrr.net"),
+            ("dididididididi", "t@iiiiiii.org"),
+            ("Ttttttt", "oooooooooo@abcd.de"),
+            ("Mmmmm", "mmmmm@rrrrrr.net"),
+            ("Zzzzzz", "rrrrrrrrrrrrr@ttttttttt.net"),
+            ("Xyz", "qqqqqqqqqq@rrrrrr.net"),
+            ("", "geug@ttttttttt.de"),
+            ("qqqqqq", "q@iiiiiii.org"),
+            ("bbbb", "bbbb@iiiiiii.org"),
+            ("", "fsfs@iiiiiii.org"),
+            ("rqrqrqrqr", "rqrqr@iiiiiii.org"),
+            ("tttttttt", "tttttttt@iiiiiii.org"),
+            ("", "tttttt@rrrrrr.net"),
+        ]
+        .iter();
+        let to: Vec<_> = to_tuples
+            .map(|(name, addr)| {
+                if name.is_empty() {
+                    Address::new_mailbox(addr.to_string())
+                } else {
+                    Address::new_mailbox_with_name(name.to_string(), addr.to_string())
+                }
+            })
+            .collect();
+
+        let mut message = email::MimeMessage::new_blank_message();
+        message.headers.insert(
+            (
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8; format=flowed; delsp=no".to_string(),
+            )
+                .into(),
+        );
+        message
+            .headers
+            .insert(Header::new_with_value("To".into(), to).unwrap());
+        message.body = "Hi".to_string();
+
+        let msg = message.as_string();
+
+        let header_end = msg.find("Hi").unwrap();
+        #[allow(clippy::indexing_slicing)]
+        let headers = msg[0..header_end].trim();
+
+        assert!(!headers.lines().any(|l| l.trim().is_empty()));
     }
 }
