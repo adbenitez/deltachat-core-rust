@@ -1539,6 +1539,24 @@ async fn create_or_lookup_mailinglist(
         name = cap[1].to_string();
     }
 
+    // if we do not have a name yet and `From` indicates, that this is a notification list,
+    // a usable name is often in the `From` header.
+    // this pattern was seen for parcel service notifications
+    // and is similar to mailchimp above, however, with weaker conditions.
+    if name.is_empty() {
+        if let Some(from) = mime_parser.from.first() {
+            if from.addr.contains("noreply")
+                || from.addr.contains("no-reply")
+                || from.addr.starts_with("notifications@")
+            {
+                if let Some(display_name) = &from.display_name {
+                    name = display_name.clone();
+                }
+            }
+        }
+    }
+
+    // as a last resort, use the ListId as the name
     if name.is_empty() {
         name = listid.clone();
     }
@@ -2006,7 +2024,7 @@ fn dc_create_incoming_rfc724_mid(
 mod tests {
     use super::*;
 
-    use crate::chat::{ChatItem, ChatVisibility};
+    use crate::chat::{get_chat_msgs, ChatItem, ChatVisibility};
     use crate::chatlist::Chatlist;
     use crate::constants::{DC_CHAT_ID_DEADDROP, DC_CONTACT_ID_INFO, DC_GCL_NO_SPECIALS};
     use crate::message::ContactRequestDecision::*;
@@ -3038,6 +3056,96 @@ mod tests {
             "399fc0402f1b154b67965632e.100761.list-id.mcsv.net"
         );
         assert_eq!(chat.name, "Atlas Obscura");
+    }
+
+    #[async_std::test]
+    async fn test_dhl_mailing_list() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+
+        dc_receive_imf(
+            &t,
+            include_bytes!("../test-data/message/mailinglist_dhl.eml"),
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        assert_eq!(
+            msg.text,
+            Some("Ihr Paket ist in der Packstation 123 – bla bla".to_string())
+        );
+        assert!(msg.has_html());
+        let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.blocked, Blocked::Deaddrop);
+        assert_eq!(chat.grpid, "1234ABCD-123LMNO.mailing.dhl.de");
+        assert_eq!(chat.name, "DHL Paket");
+    }
+
+    #[async_std::test]
+    async fn test_dpd_mailing_list() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+
+        dc_receive_imf(
+            &t,
+            include_bytes!("../test-data/message/mailinglist_dpd.eml"),
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        assert_eq!(
+            msg.text,
+            Some("Bald ist Ihr DPD Paket da – bla bla".to_string())
+        );
+        assert!(msg.has_html());
+        let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.blocked, Blocked::Deaddrop);
+        assert_eq!(chat.grpid, "dpdde.mxmail.service.dpd.de");
+        assert_eq!(chat.name, "DPD");
+    }
+
+    #[async_std::test]
+    async fn test_mailing_list_with_mimepart_footer() {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+        let deaddrop = ChatId::new(DC_CHAT_ID_DEADDROP);
+        assert_eq!(get_chat_msgs(&t, deaddrop, 0, None).await.len(), 0);
+
+        // the mailing list message contains two top-level texts.
+        // the second text is a footer that is added by some mailing list software
+        // if the user-edited text contains html.
+        // this footer should not become a text-message in delta chat
+        // (otherwise every second mail might be the same footer)
+        dc_receive_imf(
+            &t,
+            include_bytes!("../test-data/message/mailinglist_with_mimepart_footer.eml"),
+            "INBOX",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        assert_eq!(
+            msg.text,
+            Some("[Intern] important stuff – Hi mr ... [text part]".to_string())
+        );
+        assert!(msg.has_html());
+        let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
+        assert_eq!(get_chat_msgs(&t, deaddrop, 0, None).await.len(), 1);
+        assert_eq!(get_chat_msgs(&t, msg.chat_id, 0, None).await.len(), 1);
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.blocked, Blocked::Deaddrop);
+        assert_eq!(chat.grpid, "intern.lists.abc.de");
+        assert_eq!(chat.name, "Intern");
     }
 
     #[async_std::test]
