@@ -1022,6 +1022,9 @@ pub async fn send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<Job
     param.set(Param::File, blob.as_name());
     param.set(Param::Recipients, &recipients);
 
+    msg.subject = rendered_msg.subject.clone();
+    msg.update_subject(context).await;
+
     let job = create(Action::SendMsgToSmtp, msg_id.to_u32() as i32, param, 0)?;
 
     Ok(Some(job))
@@ -1160,7 +1163,7 @@ async fn perform_job_action(
         Action::MoveMsg => job.move_msg(context, connection.inbox()).await,
         Action::FetchExistingMsgs => job.fetch_existing_msgs(context, connection.inbox()).await,
         Action::Housekeeping => {
-            sql::housekeeping(context).await.log(context);
+            sql::housekeeping(context).await.ok_or_log(context);
             Status::Finished(Ok(()))
         }
     };

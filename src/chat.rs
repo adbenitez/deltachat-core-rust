@@ -28,7 +28,7 @@ use crate::context::Context;
 use crate::dc_tools::{
     dc_create_id, dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp,
     dc_create_smeared_timestamps, dc_get_abs_path, dc_gm2local_offset, improve_single_line_input,
-    time, IsNoneOrEmpty,
+    remove_subject_prefix, time, IsNoneOrEmpty,
 };
 use crate::ephemeral::{delete_expired_messages, schedule_ephemeral_task, Timer as EphemeralTimer};
 use crate::events::EventType;
@@ -1058,7 +1058,16 @@ impl Chat {
                     new_references = format!("{} {}", parent_in_reply_to, parent_rfc724_mid);
                 } else if !parent_in_reply_to.is_empty() {
                     new_references = parent_in_reply_to;
+                } else {
+                    // as a fallback, use our Message-ID, see reasoning below.
+                    new_references = new_rfc724_mid.clone();
                 }
+            } else {
+                // this is a top-level message, add our Message-ID as first reference.
+                // as we always try to extract the grpid also from `References:`-header,
+                // this allows group conversations also if smtp-server as outlook change `Message-ID:`-header
+                // (MUAs usually keep the first Message-ID in `References:`-header unchanged).
+                new_references = new_rfc724_mid.clone();
             }
         }
 
@@ -1134,6 +1143,7 @@ impl Chat {
                         type,
                         state,
                         txt,
+                        subject,
                         param,
                         hidden,
                         mime_in_reply_to,
@@ -1143,7 +1153,7 @@ impl Chat {
                         location_id,
                         ephemeral_timer,
                         ephemeral_timestamp)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 paramsv![
                     new_rfc724_mid,
                     self.id,
@@ -1153,6 +1163,7 @@ impl Chat {
                     msg.viewtype,
                     msg.state,
                     msg.text.as_ref().cloned().unwrap_or_default(),
+                    &msg.subject,
                     msg.param.to_string(),
                     msg.hidden,
                     msg.in_reply_to.as_deref().unwrap_or_default(),
@@ -2770,6 +2781,8 @@ pub async fn forward_msgs(
             msg.param.remove(Param::Cmd);
             msg.param.remove(Param::OverrideSenderDisplayname);
 
+            msg.subject = format!("Fwd: {}", remove_subject_prefix(&msg.subject));
+
             let new_msg_id: MsgId;
             if msg.state == MessageState::OutPreparing {
                 let fresh9 = curr_timestamp;
@@ -3063,6 +3076,7 @@ mod tests {
     use crate::chatlist::Chatlist;
     use crate::constants::{DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS};
     use crate::contact::Contact;
+    use crate::dc_receive_imf::dc_receive_imf;
     use crate::test_utils::TestContext;
 
     #[async_std::test]
@@ -3834,5 +3848,66 @@ mod tests {
         assert!(!chat_id.is_special());
         assert!(chat_id.is_self_talk(&ctx).await.unwrap());
         assert_eq!(blocked, Blocked::Not);
+    }
+
+    #[async_std::test]
+    async fn test_group_with_removed_message_id() {
+        // Alice creates a group with Bob, sends a message to bob
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        alice
+            .set_config(Config::ShowEmails, Some("2"))
+            .await
+            .unwrap();
+        bob.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+
+        let (contact_id, _) =
+            Contact::add_or_lookup(&alice, "", "bob@example.net", Origin::ManuallyCreated)
+                .await
+                .unwrap();
+        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "grp")
+            .await
+            .unwrap();
+        let alice_chat = Chat::load_from_db(&alice, alice_chat_id).await.unwrap();
+        add_contact_to_chat(&alice, alice_chat_id, contact_id).await;
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await.len(), 2);
+        send_text_msg(&alice, alice_chat_id, "hi!".to_string())
+            .await
+            .ok();
+        assert_eq!(get_chat_msgs(&alice, alice_chat_id, 0, None).await.len(), 1);
+
+        // Alice has an SMTP-server replacing the `Message-ID:`-header (as done eg. by outlook.com).
+        let msg = alice.pop_sent_msg().await.payload();
+        assert_eq!(msg.match_indices("Gr.").count(), 2);
+        let msg = msg.replace("Message-ID: <Gr.", "Message-ID: <XXX");
+        assert_eq!(msg.match_indices("Gr.").count(), 1);
+
+        // Bob receives this message, he may detect group by `References:`- or `Chat-Group:`-header
+        dc_receive_imf(&bob, msg.as_bytes(), "INBOX", 1, false)
+            .await
+            .unwrap();
+        let msg = bob.get_last_msg().await;
+
+        let bob_chat = Chat::load_from_db(&bob, msg.chat_id).await.unwrap();
+        assert_eq!(bob_chat.grpid, alice_chat.grpid);
+
+        // Bob answers - simulate a normal MUA by not setting `Chat-*`-headers;
+        // moreover, Bob's SMTP-server also replaces the `Message-ID:`-header
+        send_text_msg(&bob, bob_chat.id, "ho!".to_string())
+            .await
+            .ok();
+        let msg = bob.pop_sent_msg().await.payload();
+        let msg = msg.replace("Message-ID: <Gr.", "Message-ID: <XXX");
+        let msg = msg.replace("Chat-", "XXXX-");
+        assert_eq!(msg.match_indices("Chat-").count(), 0);
+
+        // Alice receives this message - she can still detect the group by the `References:`-header
+        dc_receive_imf(&alice, msg.as_bytes(), "INBOX", 2, false)
+            .await
+            .unwrap();
+        let msg = alice.get_last_msg().await;
+        assert_eq!(msg.chat_id, alice_chat_id);
+        assert_eq!(msg.text, Some("ho!".to_string()));
+        assert_eq!(get_chat_msgs(&alice, alice_chat_id, 0, None).await.len(), 2);
     }
 }
