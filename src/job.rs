@@ -805,9 +805,11 @@ impl Job {
                     let mdns_enabled = job_try!(context.get_config_bool(Config::MdnsEnabled).await);
                     if mdns_enabled {
                         let chat = job_try!(Chat::load_from_db(context, msg.chat_id).await);
-                        if chat.typ != Chattype::Group && let Err(err) = send_mdn(context, &msg).await {
-                            warn!(context, "could not send out mdn for {}: {}", msg.id, err);
-                            return Status::Finished(Err(err));
+                        if chat.typ != Chattype::Group {
+                            if let Err(err) = send_mdn(context, &msg).await {
+                                warn!(context, "could not send out mdn for {}: {}", msg.id, err);
+                                return Status::Finished(Err(err));
+                            }
                         }
                     }
                 }

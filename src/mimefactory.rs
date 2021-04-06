@@ -285,7 +285,7 @@ impl<'a> MimeFactory<'a> {
                         .param
                         .get_bool(Param::ForcePlaintext)
                         .unwrap_or_default()
-			|| (!context.get_config_bool(Config::E2eeEnabled).await
+			|| (!context.get_config_bool(Config::E2eeEnabled).await.unwrap_or_default()
 			    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default())
                 }
             }
@@ -300,7 +300,7 @@ impl<'a> MimeFactory<'a> {
                 .param
                 .get_bool(Param::SkipAutocrypt)
                 .unwrap_or_default()
-		|| (!context.get_config_bool(Config::E2eeEnabled).await
+		|| (!context.get_config_bool(Config::E2eeEnabled).await.unwrap_or_default()
 		    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()),
             Loaded::MDN { .. } => true,
         }
