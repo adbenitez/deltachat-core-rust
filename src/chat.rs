@@ -2178,12 +2178,13 @@ pub async fn create_group_chat(
         .execute(
             sqlx::query(
                 "INSERT INTO chats
-            (type, name, grpid, param, created_timestamp)
-            VALUES(?, ?, ?, \'U=1\', ?);",
+            (type, name, grpid, param, muted_until, created_timestamp)
+            VALUES(?, ?, ?, \'U=1\', ?, ?);",
             )
             .bind(Chattype::Group)
             .bind(chat_name)
             .bind(&grpid)
+            .bind(MuteDuration::Forever)
             .bind(time()),
         )
         .await?;
