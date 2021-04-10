@@ -2861,7 +2861,9 @@ pub(crate) async fn get_chat_cnt(context: &Context) -> Result<usize, Error> {
         // no database, no chats - this is no error (needed eg. for information)
         let count = context
             .sql
-            .count("SELECT COUNT(*) FROM chats WHERE id>9 AND blocked=0;")
+            .count(sqlx::query(
+                "SELECT COUNT(*) FROM chats WHERE id>9 AND blocked=0;",
+            ))
             .await?;
         Ok(count as usize)
     } else {
@@ -3031,7 +3033,10 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
         .sql
         .execute(sqlx::query("DELETE FROM msgs WHERE from_id=?;").bind(DC_CONTACT_ID_DEVICE as i32))
         .await?;
-    context.sql.execute("DELETE FROM devmsglabels;").await?;
+    context
+        .sql
+        .execute(sqlx::query("DELETE FROM devmsglabels;"))
+        .await?;
     Ok(())
 }
 
