@@ -39,7 +39,7 @@ const UPPER_LIMIT_FILE_SIZE: u64 = 49 * 1024 * 1024 / 4 * 3;
 #[derive(Debug, Clone)]
 pub enum Loaded {
     Message { chat: Chat },
-    MDN { additional_msg_ids: Vec<String> },
+    Mdn { additional_msg_ids: Vec<String> },
 }
 
 /// Helper to construct mime messages.
@@ -207,7 +207,7 @@ impl<'a> MimeFactory<'a> {
                 contact.get_addr().to_string(),
             )],
             timestamp,
-            loaded: Loaded::MDN { additional_msg_ids },
+            loaded: Loaded::Mdn { additional_msg_ids },
             msg,
             in_reply_to: String::default(),
             references: String::default(),
@@ -258,7 +258,7 @@ impl<'a> MimeFactory<'a> {
                         .get_bool(Param::GuaranteeE2ee)
                         .unwrap_or_default()
             }
-            Loaded::MDN { .. } => false,
+            Loaded::Mdn { .. } => false,
         }
     }
 
@@ -271,7 +271,7 @@ impl<'a> MimeFactory<'a> {
                     PeerstateVerifiedStatus::Unverified
                 }
             }
-            Loaded::MDN { .. } => PeerstateVerifiedStatus::Unverified,
+            Loaded::Mdn { .. } => PeerstateVerifiedStatus::Unverified,
         }
     }
 
@@ -289,7 +289,7 @@ impl<'a> MimeFactory<'a> {
 			    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default())
                 }
             }
-            Loaded::MDN { .. } => true,
+            Loaded::Mdn { .. } => true,
         }
     }
 
@@ -302,7 +302,7 @@ impl<'a> MimeFactory<'a> {
                 .unwrap_or_default()
 		|| (!context.get_config_bool(Config::E2eeEnabled).await.unwrap_or_default()
 		    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()),
-            Loaded::MDN { .. } => true,
+            Loaded::Mdn { .. } => true,
         }
     }
 
@@ -317,7 +317,7 @@ impl<'a> MimeFactory<'a> {
                     Ok(self.msg.param.get_cmd() == SystemMessage::MemberAddedToGroup)
                 }
             }
-            Loaded::MDN { .. } => Ok(false),
+            Loaded::Mdn { .. } => Ok(false),
         }
     }
 
@@ -347,7 +347,7 @@ impl<'a> MimeFactory<'a> {
 
                 None
             }
-            Loaded::MDN { .. } => None,
+            Loaded::Mdn { .. } => None,
         }
     }
 
@@ -392,7 +392,7 @@ impl<'a> MimeFactory<'a> {
                     stock_str::subject_for_new_contact(context, self_name).await
                 }
             }
-            Loaded::MDN { .. } => stock_str::read_rcpt(context).await,
+            Loaded::Mdn { .. } => stock_str::read_rcpt(context).await,
         };
 
         Ok(subject)
@@ -449,7 +449,7 @@ impl<'a> MimeFactory<'a> {
 
         unprotected_headers.push(Header::new("Chat-Version".to_string(), "1.0".to_string()));
 
-        if let Loaded::MDN { .. } = self.loaded {
+        if let Loaded::Mdn { .. } = self.loaded {
             unprotected_headers.push(Header::new(
                 "Auto-Submitted".to_string(),
                 "auto-replied".to_string(),
@@ -494,7 +494,7 @@ impl<'a> MimeFactory<'a> {
 
         let rfc724_mid = match self.loaded {
             Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
-            Loaded::MDN { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
+            Loaded::Mdn { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
         };
 
         let ephemeral_timer = self.msg.chat_id.get_ephemeral_timer(context).await?;
@@ -531,7 +531,7 @@ impl<'a> MimeFactory<'a> {
                 )
                 .await?
             }
-            Loaded::MDN { .. } => (self.render_mdn(context).await?, Vec::new()),
+            Loaded::Mdn { .. } => (self.render_mdn(context).await?, Vec::new()),
         };
 
         let peerstates = self.peerstates_for_recipients(context).await?;
@@ -701,7 +701,7 @@ impl<'a> MimeFactory<'a> {
     ) -> Result<(PartBuilder, Vec<PartBuilder>), Error> {
         let chat = match &self.loaded {
             Loaded::Message { chat } => chat,
-            Loaded::MDN { .. } => bail!("Attempt to render MDN as a message"),
+            Loaded::Mdn { .. } => bail!("Attempt to render MDN as a message"),
         };
         let command = self.msg.param.get_cmd();
         let mut placeholdertext = None;
@@ -1034,7 +1034,7 @@ impl<'a> MimeFactory<'a> {
 
         let additional_msg_ids = match &self.loaded {
             Loaded::Message { .. } => bail!("Attempt to render a message as MDN"),
-            Loaded::MDN {
+            Loaded::Mdn {
                 additional_msg_ids, ..
             } => additional_msg_ids,
         };
