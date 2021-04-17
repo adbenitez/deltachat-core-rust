@@ -1771,13 +1771,20 @@ async fn create_multiuser_record(
 ) -> Result<ChatId> {
     context.sql.execute(
         sqlx::query(
-            "INSERT INTO chats (type, name, grpid, blocked, created_timestamp, protected) VALUES(?, ?, ?, ?, ?, ?);")
+            "INSERT INTO chats (type, name, grpid, blocked, created_timestamp, protected, muted_until) VALUES(?, ?, ?, ?, ?, ?, ?);")
             .bind(chattype)
             .bind(grpname.as_ref())
             .bind(grpid.as_ref())
             .bind(create_blocked)
             .bind(time())
             .bind(create_protected)
+            .bind(
+		if chattype == Chattype::Group || chattype == Chattype::Mailinglist {
+		    -1
+		} else {
+		    0
+		}
+	    )
     ).await?;
 
     let row_id = context
