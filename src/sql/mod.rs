@@ -86,6 +86,7 @@ impl Sql {
             .read_only(false)
             .busy_timeout(Duration::from_secs(100))
             .create_if_missing(true)
+            .shared_cache(true)
             .synchronous(SqliteSynchronous::Normal);
 
         PoolOptions::<Sqlite>::new()
@@ -112,6 +113,7 @@ PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
             .journal_mode(SqliteJournalMode::Wal)
             .filename(dbfile.as_ref())
             .read_only(readonly)
+            .shared_cache(true)
             .busy_timeout(Duration::from_secs(100))
             .synchronous(SqliteSynchronous::Normal);
 
@@ -122,6 +124,7 @@ PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
                     let q = r#"
 PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
 PRAGMA query_only=1; -- Protect against writes even in read-write mode
+PRAGMA read_uncommitted=1; -- This helps avoid "table locked" errors in shared cache mode
 "#;
 
                     conn.execute_many(sqlx::query(q))
@@ -220,6 +223,18 @@ PRAGMA query_only=1; -- Protect against writes even in read-write mode
 
         let rows = pool.execute(query).await?;
         Ok(rows.rows_affected())
+    }
+
+    /// Executes the given query, returning the last inserted row ID.
+    pub async fn insert<'q, E>(&self, query: Query<'q, Sqlite, E>) -> Result<i64>
+    where
+        E: 'q + IntoArguments<'q, Sqlite>,
+    {
+        let lock = self.writer.read().await;
+        let pool = lock.as_ref().ok_or(Error::SqlNoConnection)?;
+
+        let rows = pool.execute(query).await?;
+        Ok(rows.last_insert_rowid())
     }
 
     /// Execute many queries.
@@ -483,52 +498,6 @@ PRAGMA query_only=1; -- Protect against writes even in read-write mode
         self.get_raw_config(key)
             .await
             .map(|s| s.and_then(|r| r.parse().ok()))
-    }
-
-    /// Alternative to sqlite3_last_insert_rowid() which MUST NOT be used due to race conditions, see comment above.
-    /// the ORDER BY ensures, this function always returns the most recent id,
-    /// eg. if a Message-ID is split into different messages.
-    pub async fn get_rowid(
-        &self,
-        table: impl AsRef<str>,
-        field: impl AsRef<str>,
-        value: impl AsRef<str>,
-    ) -> Result<i64> {
-        // alternative to sqlite3_last_insert_rowid() which MUST NOT be used due to race conditions, see comment above.
-        // the ORDER BY ensures, this function always returns the most recent id,
-        // eg. if a Message-ID is split into different messages.
-        let query = format!(
-            "SELECT id FROM {} WHERE {}=? ORDER BY id DESC",
-            table.as_ref(),
-            field.as_ref(),
-        );
-
-        self.query_get_value(sqlx::query(&query).bind(value.as_ref()))
-            .await
-            .map(|id| id.unwrap_or_default())
-    }
-
-    /// Fetches the rowid by restricting the rows through two different key, value settings.
-    pub async fn get_rowid2(
-        &self,
-        table: impl AsRef<str>,
-        field: impl AsRef<str>,
-        value: i64,
-        field2: impl AsRef<str>,
-        value2: i64,
-    ) -> Result<i64> {
-        let query = format!(
-            "SELECT id FROM {} WHERE {}={} AND {}={} ORDER BY id DESC",
-            table.as_ref(),
-            field.as_ref(),
-            value,
-            field2.as_ref(),
-            value2,
-        );
-
-        self.query_get_value(sqlx::query(&query))
-            .await
-            .map(|id| id.unwrap_or_default())
     }
 }
 
