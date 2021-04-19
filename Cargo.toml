@@ -103,6 +103,14 @@ required-features = ["repl"]
 name = "create_account"
 harness = false
 
+[[bench]]
+name = "contacts"
+harness = false
+
+[[bench]]
+name = "search_msgs"
+harness = false
+
 [features]
 default = []
 internals = []
