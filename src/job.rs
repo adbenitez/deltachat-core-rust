@@ -130,7 +130,7 @@ impl From<Action> for Thread {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub job_id: u32,
     pub action: Action,
@@ -1033,7 +1033,7 @@ pub(crate) enum Connection<'a> {
     Smtp(&'a mut Smtp),
 }
 
-async fn load_imap_deletion_job(context: &Context) -> sql::Result<Option<Job>> {
+pub(crate) async fn load_imap_deletion_job(context: &Context) -> sql::Result<Option<Job>> {
     let res = if let Some(msg_id) = load_imap_deletion_msgid(context).await? {
         info!(context, "verbose (issue 2335): loading imap deletion job");
         Some(Job::new(
@@ -1121,7 +1121,7 @@ pub(crate) async fn perform_job(context: &Context, mut connection: Connection<'_
             if let Err(err) = res {
                 warn!(
                     context,
-                    "{} removes job {} as it failed with error {:?}", &connection, job, err
+                    "{} removes job {} as it failed with error {:#}", &connection, job, err
                 );
             } else {
                 info!(
