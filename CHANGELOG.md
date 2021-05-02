@@ -1,5 +1,29 @@
 # Changelog 
 
+## Unreleased
+
+- switch back from `sqlx` to `rusqlite` due to performance regressions #2380 #2381 #2385 #2387
+
+- global search performance improvement #2364 #2365 #2366
+
+- improve SQLite performance with `PRAGMA synchronous=normal` #2382
+
+- python: fix building of bindings against system-wide install of `libdeltachat` #2383 #2385
+
+- fix creation of many delete jobs when being offline #2372
+
+- synchronize status between devices #2386
+
+- deaddrop (contact requests) chat improvements #2373
+
+- add "Forwarded:" to notification and chatlist summaries #2310
+
+- place user avatar directly into `Chat-User-Avatar` header #2232
+
+- improve tests #2360 #2362 #2370 #2377 #2387
+
+- cleanup #2359 #2361 #2374 #2376 #2379 #2388
+
 ## 1.53.0
 
 - fix sqlx performance regression #2355 2356

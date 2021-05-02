@@ -243,6 +243,8 @@ pub(crate) async fn dc_receive_imf_inner(
             context,
             from_id,
             mime_parser.footer.clone().unwrap_or_default(),
+            mime_parser.was_encrypted(),
+            mime_parser.has_chat_version(),
         )
         .await
         {
@@ -1932,7 +1934,7 @@ async fn check_verified_properties(
             paramsv![],
             |row| {
                 let to_addr: String = row.get(0)?;
-                let is_verified: i32 = row.get(1)?;
+                let is_verified: i32 = row.get(1).unwrap_or(0);
                 Ok((to_addr, is_verified != 0))
             },
             |rows| {

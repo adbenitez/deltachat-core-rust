@@ -11,6 +11,7 @@ use anyhow::Context as _;
 use async_std::prelude::*;
 use rusqlite::OpenFlags;
 
+use crate::blob::BlobObject;
 use crate::chat::{add_device_msg, update_device_icon, update_saved_messages_icon};
 use crate::config::Config;
 use crate::constants::{Viewtype, DC_CHAT_ID_TRASH};
@@ -25,10 +26,10 @@ use crate::stock_str;
 #[macro_export]
 macro_rules! paramsv {
     () => {
-        Vec::new()
+        rusqlite::params_from_iter(Vec::<&dyn $crate::ToSql>::new())
     };
     ($($param:expr),+ $(,)?) => {
-        vec![$(&$param as &dyn $crate::ToSql),+]
+        rusqlite::params_from_iter(vec![$(&$param as &dyn $crate::ToSql),+])
     };
 }
 
@@ -138,7 +139,7 @@ impl Sql {
             // this should be done before updates that use high-level objects that
             // rely themselves on the low-level structure.
 
-            let (recalc_fingerprints, update_icons, disable_server_delete) =
+            let (recalc_fingerprints, update_icons, disable_server_delete, recode_avatar) =
                 migrations::run(context, self).await?;
 
             // (2) updates that require high-level objects
@@ -183,6 +184,23 @@ impl Sql {
                         .await?;
                 }
             }
+
+            if recode_avatar {
+                if let Some(avatar) = context.get_config(Config::Selfavatar).await? {
+                    let mut blob = BlobObject::new_from_path(context, &avatar).await?;
+                    match blob.recode_to_avatar_size(context).await {
+                        Ok(()) => {
+                            context
+                                .set_config(Config::Selfavatar, Some(&avatar))
+                                .await?
+                        }
+                        Err(e) => {
+                            warn!(context, "Migrations can't recode avatar, removing. {:#}", e);
+                            context.set_config(Config::Selfavatar, None).await?
+                        }
+                    }
+                }
+            }
         }
 
         info!(context, "Opened {:?}.", dbfile.as_ref());
@@ -194,7 +212,7 @@ impl Sql {
     pub async fn execute(
         &self,
         query: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
     ) -> Result<usize> {
         let conn = self.get_conn().await?;
         let res = conn.execute(query.as_ref(), params)?;
@@ -205,7 +223,7 @@ impl Sql {
     pub async fn insert(
         &self,
         query: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
     ) -> anyhow::Result<usize> {
         let conn = self.get_conn().await?;
         conn.execute(query.as_ref(), params)?;
@@ -218,7 +236,7 @@ impl Sql {
     pub async fn query_map<T, F, G, H>(
         &self,
         sql: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
         f: F,
         mut g: G,
     ) -> Result<H>
@@ -230,7 +248,7 @@ impl Sql {
 
         let conn = self.get_conn().await?;
         let mut stmt = conn.prepare(sql)?;
-        let res = stmt.query_map(&params, f)?;
+        let res = stmt.query_map(params, f)?;
         g(res)
     }
 
@@ -276,7 +294,7 @@ impl Sql {
     pub async fn count(
         &self,
         query: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
     ) -> anyhow::Result<usize> {
         let count: isize = self.query_row(query, params, |row| row.get(0)).await?;
         Ok(usize::try_from(count)?)
@@ -284,7 +302,7 @@ impl Sql {
 
     /// Used for executing `SELECT COUNT` statements only. Returns `true`, if the count is at least
     /// one, `false` otherwise.
-    pub async fn exists(&self, sql: &str, params: Vec<&dyn crate::ToSql>) -> Result<bool> {
+    pub async fn exists(&self, sql: &str, params: impl rusqlite::Params) -> Result<bool> {
         let count = self.count(sql, params).await?;
         Ok(count > 0)
     }
@@ -293,7 +311,7 @@ impl Sql {
     pub async fn query_row<T, F>(
         &self,
         query: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
         f: F,
     ) -> Result<T>
     where
@@ -377,7 +395,7 @@ impl Sql {
     pub async fn query_row_optional<T, F>(
         &self,
         sql: impl AsRef<str>,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
         f: F,
     ) -> anyhow::Result<Option<T>>
     where
@@ -402,7 +420,7 @@ impl Sql {
     pub async fn query_get_value<T>(
         &self,
         query: &str,
-        params: Vec<&dyn crate::ToSql>,
+        params: impl rusqlite::Params,
     ) -> anyhow::Result<Option<T>>
     where
         T: rusqlite::types::FromSql,
