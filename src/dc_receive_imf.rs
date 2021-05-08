@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::chat::{self, Chat, ChatId, ProtectionStatus};
+use crate::chat::{self, Chat, ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, ShowEmails, Viewtype, DC_CHAT_ID_TRASH, DC_CONTACT_ID_LAST_SPECIAL,
@@ -474,10 +474,9 @@ async fn add_parts(
             }
         }
 
-        let (test_normal_chat_id, test_normal_chat_id_blocked) =
-            chat::lookup_by_contact_id(context, from_id)
-                .await
-                .unwrap_or_default();
+        let test_normal_chat = ChatIdBlocked::lookup_by_contact(context, from_id)
+            .await
+            .unwrap_or_default();
 
         // get the chat_id - a chat_id here is no indicator that the chat is displayed in the normal list,
         // it might also be blocked and displayed in the deaddrop as a result
@@ -498,17 +497,18 @@ async fn add_parts(
         if chat_id.is_unset() {
             // try to create a group
 
-            let create_blocked =
-                if !test_normal_chat_id.is_unset() && test_normal_chat_id_blocked == Blocked::Not {
-                    Blocked::Not
-                } else {
-                    Blocked::Deaddrop
-                };
+            let create_blocked = match test_normal_chat {
+                Some(ChatIdBlocked {
+                    id: _,
+                    blocked: Blocked::Not,
+                }) => Blocked::Not,
+                _ => Blocked::Deaddrop,
+            };
 
             let (new_chat_id, new_chat_id_blocked) = create_or_lookup_group(
                 context,
                 &mut mime_parser,
-                if test_normal_chat_id.is_unset() {
+                if test_normal_chat.is_none() {
                     allow_creation
                 } else {
                     true
@@ -600,16 +600,17 @@ async fn add_parts(
                 Blocked::Deaddrop
             };
 
-            if !test_normal_chat_id.is_unset() {
-                *chat_id = test_normal_chat_id;
-                chat_id_blocked = test_normal_chat_id_blocked;
+            if let Some(chat) = test_normal_chat {
+                *chat_id = chat.id;
+                chat_id_blocked = chat.blocked;
             } else if allow_creation {
-                let (id, bl) =
-                    chat::create_or_lookup_by_contact_id(context, from_id, create_blocked)
-                        .await
-                        .unwrap_or_default();
-                *chat_id = id;
-                chat_id_blocked = bl;
+                if let Ok(chat) = ChatIdBlocked::get_for_contact(context, from_id, create_blocked)
+                    .await
+                    .log_err(context, "Failed to get (new) chat for contact")
+                {
+                    *chat_id = chat.id;
+                    chat_id_blocked = chat.blocked;
+                }
             }
             if !chat_id.is_unset() && Blocked::Not != chat_id_blocked {
                 if Blocked::Not == create_blocked {
@@ -725,11 +726,12 @@ async fn add_parts(
                 } else {
                     Blocked::Deaddrop
                 };
-                let (id, bl) = chat::create_or_lookup_by_contact_id(context, to_id, create_blocked)
-                    .await
-                    .unwrap_or_default();
-                *chat_id = id;
-                chat_id_blocked = bl;
+                if let Ok(chat) =
+                    ChatIdBlocked::get_for_contact(context, to_id, create_blocked).await
+                {
+                    *chat_id = chat.id;
+                    chat_id_blocked = chat.blocked;
+                }
 
                 if !chat_id.is_unset()
                     && Blocked::Not != chat_id_blocked
@@ -747,12 +749,14 @@ async fn add_parts(
         if chat_id.is_unset() && self_sent {
             // from_id==to_id==DC_CONTACT_ID_SELF - this is a self-sent messages,
             // maybe an Autocrypt Setup Message
-            let (id, bl) =
-                chat::create_or_lookup_by_contact_id(context, DC_CONTACT_ID_SELF, Blocked::Not)
+            if let Ok(chat) =
+                ChatIdBlocked::get_for_contact(context, DC_CONTACT_ID_SELF, Blocked::Not)
                     .await
-                    .unwrap_or_default();
-            *chat_id = id;
-            chat_id_blocked = bl;
+                    .log_err(context, "Failed to get (new) chat for contact")
+            {
+                *chat_id = chat.id;
+                chat_id_blocked = chat.blocked;
+            }
 
             if !chat_id.is_unset() && Blocked::Not != chat_id_blocked {
                 chat_id.unblock(context).await;
@@ -2359,7 +2363,7 @@ mod tests {
         let t = TestContext::new_alice().await;
 
         let bob_id = Contact::create(&t, "bob", "bob@example.com").await.unwrap();
-        let one2one_id = chat::create_by_contact_id(&t, bob_id).await.unwrap();
+        let one2one_id = ChatId::create_for_contact(&t, bob_id).await.unwrap();
         one2one_id
             .set_visibility(&t, ChatVisibility::Archived)
             .await
@@ -2528,7 +2532,7 @@ mod tests {
         let contact_id = Contact::create(&t, "foobar", "foobar@example.com")
             .await
             .unwrap();
-        let chat_id = chat::create_by_contact_id(&t, contact_id).await.unwrap();
+        let chat_id = ChatId::create_for_contact(&t, contact_id).await.unwrap();
         dc_receive_imf(
             &t,
             b"From: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= <foobar@example.com>\n\

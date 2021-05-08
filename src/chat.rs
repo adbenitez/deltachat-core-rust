@@ -4,8 +4,7 @@ use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Context as _;
-use anyhow::{bail, ensure, format_err, Result};
+use anyhow::{bail, ensure, format_err, Context as _, Result};
 use async_std::path::{Path, PathBuf};
 use deltachat_derive::{FromSql, ToSql};
 use itertools::Itertools;
@@ -154,6 +153,66 @@ impl ChatId {
     /// [`Chatlist`]: crate::chatlist::Chatlist
     pub fn is_alldone_hint(self) -> bool {
         self == DC_CHAT_ID_ALLDONE_HINT
+    }
+
+    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id` if it exists.
+    ///
+    /// If it does not exist, `None` is returned.
+    pub async fn lookup_by_contact(context: &Context, contact_id: u32) -> Result<Option<Self>> {
+        ChatIdBlocked::lookup_by_contact(context, contact_id)
+            .await
+            .map(|lookup| lookup.map(|chat| chat.id))
+    }
+
+    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`.
+    ///
+    /// If the chat does not yet exist an unblocked chat ([`Blocked::Not`]) is created.
+    ///
+    /// This is an internal API, if **a user action** needs to get a chat
+    /// [`ChatId::create_for_contact`] should be used as this also scales up the
+    /// [`Contact`]'s origin.
+    pub async fn get_for_contact(context: &Context, contact_id: u32) -> Result<Self> {
+        ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Not)
+            .await
+            .map(|chat| chat.id)
+    }
+
+    /// Returns the unblocked 1:1 chat with `contact_id`.
+    ///
+    /// This should be used when **a user action** creates a chat 1:1, it ensures the chat
+    /// exists and is unblocked and scales the [`Contact`]'s origin.
+    ///
+    /// If a chat was in the deaddrop unblocking is how it becomes a normal chat and it will
+    /// look to the user like the chat was newly created.
+    pub async fn create_for_contact(context: &Context, contact_id: u32) -> Result<Self> {
+        let chat_id = match ChatIdBlocked::lookup_by_contact(context, contact_id).await? {
+            Some(chat) => {
+                if chat.blocked != Blocked::Not {
+                    chat.id.unblock(context).await;
+                }
+                chat.id
+            }
+            None => {
+                if Contact::real_exists_by_id(context, contact_id).await
+                    || contact_id == DC_CONTACT_ID_SELF
+                {
+                    let chat_id = ChatId::get_for_contact(context, contact_id).await?;
+                    Contact::scaleup_origin_by_id(context, contact_id, Origin::CreateChat).await;
+                    chat_id
+                } else {
+                    warn!(
+                        context,
+                        "Cannot create chat, contact {} does not exist.", contact_id,
+                    );
+                    bail!("Can not create chat for non-existing contact");
+                }
+            }
+        };
+        context.emit_event(EventType::MsgsChanged {
+            chat_id: ChatId::new(0),
+            msg_id: MsgId::new(0),
+        });
+        Ok(chat_id)
     }
 
     pub async fn set_selfavatar_timestamp(self, context: &Context, timestamp: i64) -> Result<()> {
@@ -1304,51 +1363,9 @@ pub async fn create_by_msg_id(context: &Context, msg_id: MsgId) -> Result<ChatId
     Ok(chat.id)
 }
 
-/// Create a normal chat with a single user.
-///
-/// To create group chats, see [`create_group_chat`].
-///
-/// If a chat already exists, this ID is returned, otherwise a new chat is created;
-/// this new chat may already contain messages, eg. from the deaddrop, to get the
-/// chat messages, use dc_get_chat_msgs().
-pub async fn create_by_contact_id(context: &Context, contact_id: u32) -> Result<ChatId> {
-    let chat_id = match lookup_by_contact_id(context, contact_id).await {
-        Ok((chat_id, chat_blocked)) => {
-            if chat_blocked != Blocked::Not {
-                // unblock chat (typically move it from the deaddrop to view)
-                chat_id.unblock(context).await;
-            }
-            chat_id
-        }
-        Err(err) => {
-            if !Contact::real_exists_by_id(context, contact_id).await
-                && contact_id != DC_CONTACT_ID_SELF
-            {
-                warn!(
-                    context,
-                    "Cannot create chat, contact {} does not exist.", contact_id,
-                );
-                return Err(err);
-            } else {
-                let (chat_id, _) =
-                    create_or_lookup_by_contact_id(context, contact_id, Blocked::Not).await?;
-                Contact::scaleup_origin_by_id(context, contact_id, Origin::CreateChat).await;
-                chat_id
-            }
-        }
-    };
-
-    context.emit_event(EventType::MsgsChanged {
-        chat_id: ChatId::new(0),
-        msg_id: MsgId::new(0),
-    });
-
-    Ok(chat_id)
-}
-
 pub(crate) async fn update_saved_messages_icon(context: &Context) -> Result<()> {
     // if there is no saved-messages chat, there is nothing to update. this is no error.
-    if let Ok((chat_id, _)) = lookup_by_contact_id(context, DC_CONTACT_ID_SELF).await {
+    if let Some(chat_id) = ChatId::lookup_by_contact(context, DC_CONTACT_ID_SELF).await? {
         let icon = include_bytes!("../assets/icon-saved-messages.png");
         let blob = BlobObject::create(context, "icon-saved-messages.png".to_string(), icon).await?;
         let icon = blob.as_name().to_string();
@@ -1362,7 +1379,7 @@ pub(crate) async fn update_saved_messages_icon(context: &Context) -> Result<()> 
 
 pub(crate) async fn update_device_icon(context: &Context) -> Result<()> {
     // if there is no device-chat, there is nothing to update. this is no error.
-    if let Ok((chat_id, _)) = lookup_by_contact_id(context, DC_CONTACT_ID_DEVICE).await {
+    if let Some(chat_id) = ChatId::lookup_by_contact(context, DC_CONTACT_ID_DEVICE).await? {
         let icon = include_bytes!("../assets/icon-device.png");
         let blob = BlobObject::create(context, "icon-device.png".to_string(), icon).await?;
         let icon = blob.as_name().to_string();
@@ -1379,7 +1396,7 @@ pub(crate) async fn update_device_icon(context: &Context) -> Result<()> {
 }
 
 async fn update_special_chat_name(context: &Context, contact_id: u32, name: String) -> Result<()> {
-    if let Ok((chat_id, _)) = lookup_by_contact_id(context, contact_id).await {
+    if let Some(chat_id) = ChatId::lookup_by_contact(context, contact_id).await? {
         // the `!= name` condition avoids unneeded writes
         context
             .sql
@@ -1408,95 +1425,122 @@ pub(crate) async fn update_special_chat_names(context: &Context) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn create_or_lookup_by_contact_id(
-    context: &Context,
-    contact_id: u32,
-    create_blocked: Blocked,
-) -> Result<(ChatId, Blocked)> {
-    ensure!(context.sql.is_open().await, "Database not available");
-    ensure!(contact_id > 0, "Invalid contact id requested");
+/// Handle a [`ChatId`] and its [`Blocked`] status at once.
+///
+/// This struct is an optimisation to read a [`ChatId`] and its [`Blocked`] status at once
+/// from the database.  It [`Deref`]s to [`ChatId`] so it can be used as an extension to
+/// [`ChatId`].
+///
+/// [`Deref`]: std::ops::Deref
+#[derive(Debug)]
+pub(crate) struct ChatIdBlocked {
+    pub id: ChatId,
+    pub blocked: Blocked,
+}
 
-    if let Ok((chat_id, chat_blocked)) = lookup_by_contact_id(context, contact_id).await {
-        // Already exists, no need to create.
-        return Ok((chat_id, chat_blocked));
+impl ChatIdBlocked {
+    /// Searches the database for the 1:1 chat with this contact.
+    ///
+    /// If no chat is found `None` is returned.
+    pub async fn lookup_by_contact(context: &Context, contact_id: u32) -> Result<Option<Self>> {
+        ensure!(context.sql.is_open().await, "Database not available");
+        ensure!(contact_id > 0, "Invalid contact id requested");
+
+        context
+            .sql
+            .query_row_optional(
+                "SELECT c.id, c.blocked
+                   FROM chats c
+                  INNER JOIN chats_contacts j
+                          ON c.id=j.chat_id
+                  WHERE c.type=100  -- 100 = Chattype::Single
+                    AND c.id>9      -- 9 = DC_CHAT_ID_LAST_SPECIAL
+                    AND j.contact_id=?;",
+                paramsv![contact_id],
+                |row| {
+                    let id: ChatId = row.get(0)?;
+                    let blocked: Blocked = row.get(1)?;
+                    Ok(ChatIdBlocked { id, blocked })
+                },
+            )
+            .await
+            .map_err(Into::into)
     }
 
-    let contact = Contact::load_from_db(context, contact_id).await?;
-    let chat_name = contact.get_display_name().to_string();
+    /// Returns the chat for the 1:1 chat with this contact.
+    ///
+    /// I the chat does not yet exist a new one is created, using the provided [`Blocked`]
+    /// state.
+    pub async fn get_for_contact(
+        context: &Context,
+        contact_id: u32,
+        create_blocked: Blocked,
+    ) -> Result<Self> {
+        ensure!(context.sql.is_open().await, "Database not available");
+        ensure!(contact_id > 0, "Invalid contact id requested");
 
-    context
-        .sql
-        .transaction(move |transaction| {
-            transaction.execute(
-                "INSERT INTO chats
-                 (type, name, param, blocked, created_timestamp)
-                 VALUES(?, ?, ?, ?, ?)",
-                params![
-                    Chattype::Single,
-                    chat_name,
-                    match contact_id {
-                        DC_CONTACT_ID_SELF => "K=1".to_string(), // K = Param::Selftalk
-                        DC_CONTACT_ID_DEVICE => "D=1".to_string(), // D = Param::Devicetalk
-                        _ => "".to_string(),
-                    },
-                    create_blocked as u8,
-                    time(),
-                ],
-            )?;
+        if let Some(res) = Self::lookup_by_contact(context, contact_id).await? {
+            // Already exists, no need to create.
+            return Ok(res);
+        }
 
-            transaction.execute(
-                "INSERT INTO chats_contacts
+        let contact = Contact::load_from_db(context, contact_id).await?;
+        let chat_name = contact.get_display_name().to_string();
+        let mut params = Params::new();
+        match contact_id {
+            DC_CONTACT_ID_SELF => {
+                params.set_int(Param::Selftalk, 1);
+            }
+            DC_CONTACT_ID_DEVICE => {
+                params.set_int(Param::Devicetalk, 1);
+            }
+            _ => (),
+        }
+
+        let chat_id = context
+            .sql
+            .transaction(move |transaction| {
+                transaction.execute(
+                    "INSERT INTO chats
+                     (type, name, param, blocked, created_timestamp)
+                     VALUES(?, ?, ?, ?, ?)",
+                    params![
+                        Chattype::Single,
+                        chat_name,
+                        params.to_string(),
+                        create_blocked as u8,
+                        time(),
+                    ],
+                )?;
+                let chat_id = ChatId::new(
+                    transaction
+                        .last_insert_rowid()
+                        .try_into()
+                        .context("chat table rowid overflows u32")?,
+                );
+
+                transaction.execute(
+                    "INSERT INTO chats_contacts
                  (chat_id, contact_id)
                  VALUES((SELECT last_insert_rowid()), ?)",
-                params![contact_id],
-            )?;
+                    params![contact_id],
+                )?;
 
-            Ok(())
+                Ok(chat_id)
+            })
+            .await?;
+
+        match contact_id {
+            DC_CONTACT_ID_SELF => update_saved_messages_icon(context).await?,
+            DC_CONTACT_ID_DEVICE => update_device_icon(context).await?,
+            _ => (),
+        }
+
+        Ok(Self {
+            id: chat_id,
+            blocked: create_blocked,
         })
-        .await?;
-
-    if contact_id == DC_CONTACT_ID_SELF {
-        update_saved_messages_icon(context).await?;
-    } else if contact_id == DC_CONTACT_ID_DEVICE {
-        update_device_icon(context).await?;
     }
-
-    lookup_by_contact_id(context, contact_id).await
-}
-
-pub(crate) async fn lookup_by_contact_id(
-    context: &Context,
-    contact_id: u32,
-) -> Result<(ChatId, Blocked)> {
-    ensure!(context.sql.is_open().await, "Database not available");
-
-    let row = context
-        .sql
-        .query_row(
-            "SELECT c.id, c.blocked
-               FROM chats c
-              INNER JOIN chats_contacts j
-                      ON c.id=j.chat_id
-              WHERE c.type=100
-                AND c.id>9
-                AND j.contact_id=?;",
-            paramsv![contact_id as i32],
-            |row| {
-                Ok((
-                    row.get::<_, ChatId>(0)?,
-                    row.get::<_, Option<_>>(1)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .await?;
-    Ok(row)
-}
-
-pub async fn get_by_contact_id(context: &Context, contact_id: u32) -> Result<ChatId> {
-    let (chat_id, blocked) = lookup_by_contact_id(context, contact_id).await?;
-    ensure_eq!(blocked, Blocked::Not, "Requested contact is blocked");
-
-    Ok(chat_id)
 }
 
 pub async fn prepare_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result<MsgId> {
@@ -2851,9 +2895,7 @@ pub async fn add_device_msg_with_importance(
     }
 
     if let Some(msg) = msg {
-        chat_id = create_or_lookup_by_contact_id(context, DC_CONTACT_ID_DEVICE, Blocked::Not)
-            .await?
-            .0;
+        chat_id = ChatId::get_for_contact(context, DC_CONTACT_ID_DEVICE).await?;
 
         let rfc724_mid = dc_create_outgoing_rfc724_mid(None, "@device");
         msg.try_calc_and_set_dimensions(context).await.ok();
@@ -3115,7 +3157,7 @@ mod tests {
     async fn test_add_remove_contact_for_single() {
         let ctx = TestContext::new_alice().await;
         let bob = Contact::create(&ctx, "", "bob@f.br").await.unwrap();
-        let chat_id = create_by_contact_id(&ctx, bob).await.unwrap();
+        let chat_id = ChatId::create_for_contact(&ctx, bob).await.unwrap();
         let chat = Chat::load_from_db(&ctx, chat_id).await.unwrap();
         assert_eq!(chat.typ, Chattype::Single);
         assert_eq!(get_chat_contacts(&ctx, chat.id).await.unwrap().len(), 1);
@@ -3314,10 +3356,9 @@ mod tests {
     async fn test_device_chat_cannot_sent() {
         let t = TestContext::new().await;
         t.update_device_chats().await.unwrap();
-        let (device_chat_id, _) =
-            create_or_lookup_by_contact_id(&t, DC_CONTACT_ID_DEVICE, Blocked::Not)
-                .await
-                .unwrap();
+        let device_chat_id = ChatId::get_for_contact(&t, DC_CONTACT_ID_DEVICE)
+            .await
+            .unwrap();
 
         let mut msg = Message::new(Viewtype::Text);
         msg.text = Some("message text".to_string());
@@ -3557,11 +3598,15 @@ mod tests {
             .unwrap();
         assert_ne!(contact1, 0);
 
-        let chat_id = create_by_contact_id(&context.ctx, contact1).await.unwrap();
+        let chat_id = ChatId::create_for_contact(&context.ctx, contact1)
+            .await
+            .unwrap();
         assert!(!chat_id.is_special(), "chat_id too small {}", chat_id);
         let chat = Chat::load_from_db(&context.ctx, chat_id).await.unwrap();
 
-        let chat2_id = create_by_contact_id(&context.ctx, contact1).await.unwrap();
+        let chat2_id = ChatId::create_for_contact(&context.ctx, contact1)
+            .await
+            .unwrap();
         assert_eq!(chat2_id, chat_id);
         let chat2 = Chat::load_from_db(&context.ctx, chat2_id).await.unwrap();
 
@@ -3757,46 +3802,55 @@ mod tests {
         // create contact, then unblocked chat
         let contact_id = Contact::create(&ctx, "", "bob@foo.de").await.unwrap();
         assert_ne!(contact_id, 0);
-        let res = lookup_by_contact_id(&ctx, contact_id).await;
-        assert!(res.is_err());
+        let found = ChatId::lookup_by_contact(&ctx, contact_id).await.unwrap();
+        assert!(found.is_none());
 
-        let chat_id = create_by_contact_id(&ctx, contact_id).await.unwrap();
-        let (chat_id2, blocked) = lookup_by_contact_id(&ctx, contact_id).await.unwrap();
-        assert_eq!(chat_id, chat_id2);
-        assert_eq!(blocked, Blocked::Not);
+        let chat_id = ChatId::create_for_contact(&ctx, contact_id).await.unwrap();
+        let chat2 = ChatIdBlocked::lookup_by_contact(&ctx, contact_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chat_id, chat2.id);
+        assert_eq!(chat2.blocked, Blocked::Not);
 
         // create contact, then blocked chat
         let contact_id = Contact::create(&ctx, "", "claire@foo.de").await.unwrap();
-        let (chat_id, _) = create_or_lookup_by_contact_id(&ctx, contact_id, Blocked::Manually)
+        let chat_id = ChatIdBlocked::get_for_contact(&ctx, contact_id, Blocked::Manually)
             .await
+            .unwrap()
+            .id;
+        let chat2 = ChatIdBlocked::lookup_by_contact(&ctx, contact_id)
+            .await
+            .unwrap()
             .unwrap();
-        let (chat_id2, blocked) = lookup_by_contact_id(&ctx, contact_id).await.unwrap();
-        assert_eq!(chat_id, chat_id2);
-        assert_eq!(blocked, Blocked::Manually);
+        assert_eq!(chat_id, chat2.id);
+        assert_eq!(chat2.blocked, Blocked::Manually);
 
-        // test nonexistent contact, and also check if reasonable defaults are used
-        let res = lookup_by_contact_id(&ctx, 1234).await;
-        assert!(res.is_err());
+        // test nonexistent contact
+        let found = ChatId::lookup_by_contact(&ctx, 1234).await.unwrap();
+        assert!(found.is_none());
 
-        let (chat_id, blocked) = lookup_by_contact_id(&ctx, 1234).await.unwrap_or_default();
-        assert_eq!(chat_id, ChatId::new(0));
-        assert_eq!(blocked, Blocked::Not);
+        let found = ChatIdBlocked::lookup_by_contact(&ctx, 1234).await.unwrap();
+        assert!(found.is_none());
     }
 
     #[async_std::test]
     async fn test_lookup_self_by_contact_id() {
         let ctx = TestContext::new_alice().await;
 
-        let res = lookup_by_contact_id(&ctx, DC_CONTACT_ID_SELF).await;
-        assert!(res.is_err());
-
-        ctx.update_device_chats().await.unwrap();
-        let (chat_id, blocked) = lookup_by_contact_id(&ctx, DC_CONTACT_ID_SELF)
+        let chat = ChatId::lookup_by_contact(&ctx, DC_CONTACT_ID_SELF)
             .await
             .unwrap();
-        assert!(!chat_id.is_special());
-        assert!(chat_id.is_self_talk(&ctx).await.unwrap());
-        assert_eq!(blocked, Blocked::Not);
+        assert!(chat.is_none());
+
+        ctx.update_device_chats().await.unwrap();
+        let chat = ChatIdBlocked::lookup_by_contact(&ctx, DC_CONTACT_ID_SELF)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!chat.id.is_special());
+        assert!(chat.id.is_self_talk(&ctx).await.unwrap());
+        assert_eq!(chat.blocked, Blocked::Not);
     }
 
     #[async_std::test]

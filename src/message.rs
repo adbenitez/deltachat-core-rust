@@ -1941,10 +1941,9 @@ pub async fn estimate_deletion_cnt(
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
-    let self_chat_id = chat::lookup_by_contact_id(context, DC_CONTACT_ID_SELF)
-        .await
-        .unwrap_or_default()
-        .0;
+    let self_chat_id = ChatId::lookup_by_contact(context, DC_CONTACT_ID_SELF)
+        .await?
+        .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
 
     let cnt = if from_server {
@@ -2226,7 +2225,7 @@ mod tests {
             let contact_id = Contact::create(&t.ctx, "", "bob@example.net")
                 .await
                 .unwrap();
-            chat::create_by_contact_id(&t.ctx, contact_id)
+            ChatId::create_for_contact(&t.ctx, contact_id)
                 .await
                 .unwrap();
         }
@@ -2592,10 +2591,9 @@ mod tests {
         // test that get_width() and get_height() are returning some dimensions for images;
         // (as the device-chat contains a welcome-images, we check that)
         t.update_device_chats().await.ok();
-        let (device_chat_id, _) =
-            chat::create_or_lookup_by_contact_id(&t, DC_CONTACT_ID_DEVICE, Blocked::Not)
-                .await
-                .unwrap();
+        let device_chat_id = ChatId::get_for_contact(&t, DC_CONTACT_ID_DEVICE)
+            .await
+            .unwrap();
 
         let mut has_image = false;
         let chatitems = chat::get_chat_msgs(&t, device_chat_id, 0, None)
