@@ -1033,6 +1033,33 @@ class TestOnlineAccount:
         except queue.Empty:
             pass  # mark_seen_messages() has generated events before it returns
 
+    def test_moved_markseen(self, acfactory, lp):
+        """Test that message already moved to DeltaChat folder is marked as seen."""
+        ac1 = acfactory.get_online_configuring_account(mvbox=True, config={"inbox_watch": "0"})
+        ac2 = acfactory.get_online_configuring_account()
+        acfactory.wait_configure_and_start_io([ac1, ac2])
+        ac1.set_config("bcc_self", "1")
+
+        ac1.direct_imap.idle_start()
+        ac1.create_chat(ac2).send_text("Hello!")
+        ac1.direct_imap.idle_check(terminate=True)
+        ac1.stop_io()
+
+        # Emulate moving of the message to DeltaChat folder by Sieve rule.
+        # mailcow server contains this rule by default.
+        ac1.direct_imap.conn.move(["*"], "DeltaChat")
+
+        ac1.direct_imap.select_folder("DeltaChat")
+        ac1.direct_imap.idle_start()
+        ac1.start_io()
+        ac1.direct_imap.idle_wait_for_seen()
+        ac1.direct_imap.idle_done()
+
+        fetch = list(ac1.direct_imap.conn.fetch("*", b'FLAGS').values())
+        flags = fetch[-1][b'FLAGS']
+        is_seen = b'\\Seen' in flags
+        assert is_seen
+
     def test_message_override_sender_name(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
         chat = acfactory.get_accepted_chat(ac1, ac2)
@@ -1071,16 +1098,19 @@ class TestOnlineAccount:
         # We had so many problems with markseen, if in doubt, rather create another test, it can't harm.
         ac1 = acfactory.get_online_configuring_account(move=mvbox_move, mvbox=mvbox_move)
         ac2 = acfactory.get_online_configuring_account(move=mvbox_move, mvbox=mvbox_move)
-        acfactory.wait_configure_and_start_io()
 
-        acfactory.get_accepted_chat(ac1, ac2).send_text("hi")
-        msg = ac2._evtracker.wait_next_incoming_message()
+        acfactory.wait_configure_and_start_io()
+        # Do not send BCC to self, we only want to test MDN on ac1.
+        ac1.set_config("bcc_self", "0")
 
         folder = "mvbox" if mvbox_move else "inbox"
         ac1.direct_imap.select_config_folder(folder)
         ac2.direct_imap.select_config_folder(folder)
         ac1.direct_imap.idle_start()
         ac2.direct_imap.idle_start()
+
+        acfactory.get_accepted_chat(ac1, ac2).send_text("hi")
+        msg = ac2._evtracker.wait_next_incoming_message()
 
         ac2.mark_seen_messages([msg])
 
@@ -2396,26 +2426,31 @@ class TestOnlineAccount:
         assert received_reply.quoted_text == "hello"
         assert received_reply.quote.id == out_msg.id
 
-    @pytest.mark.parametrize("folder,move,expected_destination,", [
-        ("xyz", False, "xyz"),  # Test that emails are recognized in a random folder but not moved
-        ("xyz", True, "DeltaChat"),  # ...emails are found in a random folder and moved to DeltaChat
-        ("Spam", False, "INBOX")  # ...emails are moved from the spam folder to the Inbox
+    @pytest.mark.parametrize("folder,move,expected_destination,inbox_watch,", [
+        ("xyz", False, "xyz", "1"),  # Test that emails are recognized in a random folder but not moved
+        ("xyz", True, "DeltaChat", "1"),  # ...emails are found in a random folder and moved to DeltaChat
+        ("Spam", False, "INBOX", "1"),  # ...emails are moved from the spam folder to the Inbox
+        ("INBOX", False, "INBOX", "0"),  # ...emails are found in the `Inbox` folder even if `inbox_watch` is "0"
     ])
     # Testrun.org does not support the CREATE-SPECIAL-USE capability, which means that we can't create a folder with
     # the "\Junk" flag (see https://tools.ietf.org/html/rfc6154). So, we can't test spam folder detection by flag.
-    def test_scan_folders(self, acfactory, lp, folder, move, expected_destination):
+    def test_scan_folders(self, acfactory, lp, folder, move, expected_destination, inbox_watch):
         """Delta Chat periodically scans all folders for new messages to make sure we don't miss any."""
         variant = folder + "-" + str(move) + "-" + expected_destination
         lp.sec("Testing variant " + variant)
         ac1 = acfactory.get_online_configuring_account(move=move)
         ac2 = acfactory.get_online_configuring_account()
+        ac1.set_config("inbox_watch", inbox_watch)
 
         acfactory.wait_configure(ac1)
         ac1.direct_imap.create_folder(folder)
 
         acfactory.wait_configure_and_start_io()
         # Wait until each folder was selected once and we are IDLEing:
-        ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
+        if inbox_watch == "1":
+            ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
+        else:
+            ac1._evtracker.get_info_contains("IMAP-fake-IDLE: no folder, waiting for interrupt")
         ac1.stop_io()
 
         # Send a message to ac1 and move it to the mvbox:
@@ -2432,7 +2467,10 @@ class TestOnlineAccount:
         assert msg.text == "hello"
 
         # Wait until the message was moved (if at all) and we are IDLEing again:
-        ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
+        if inbox_watch == "1":
+            ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
+        else:
+            ac1._evtracker.get_info_contains("IMAP-fake-IDLE: no folder, waiting for interrupt")
         ac1.direct_imap.select_folder(expected_destination)
         assert len(ac1.direct_imap.get_all_messages()) == 1
         if folder != expected_destination:
