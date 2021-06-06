@@ -2,8 +2,8 @@
 
 set -x -e
 
-# we use the python3.6 environment as the base environment
-/opt/python/cp36-cp36m/bin/pip install tox devpi-client auditwheel
+# we use the python3.6 environment as the base environment 
+/opt/python/cp36-cp36m/bin/pip install tox devpi-client auditwheel 
 
 pushd /usr/bin
 

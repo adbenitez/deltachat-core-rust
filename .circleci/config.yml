@@ -27,7 +27,10 @@ jobs:
       - checkout
       # the following commands on success produces
       # workspace/{wheelhouse,py-docs} as artefact directories
-      - run: bash scripts/remote_python_packaging.sh
+      - run:
+          # building aarch64 packages under qemu is very slow
+          no_output_timeout: 60m
+          command: bash scripts/remote_python_packaging.sh
       - persist_to_workspace:
           root: workspace
           paths:
@@ -51,18 +54,24 @@ workflows:
     jobs:
       - remote_python_packaging:
           filters:
+            tags:
+              only: /.+/
             branches:
-              only: master
+              ignore: /.*/
+
+      - build_doxygen:
+          filters:
+            tags:
+              only: /.+/
+            branches:
+              ignore: /.*/
 
       - upload_docs_wheels:
           requires:
              - remote_python_packaging
              - build_doxygen
           filters:
+            tags:
+              only: /.+/
             branches:
-              only: master
-
-      - build_doxygen:
-          filters:
-            branches:
-              only: master
+              ignore: /.*/
