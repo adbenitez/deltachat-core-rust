@@ -2862,6 +2862,16 @@ pub unsafe extern "C" fn dc_msg_get_showpadlock(msg: *mut dc_msg_t) -> libc::c_i
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_msg_is_bot(msg: *mut dc_msg_t) -> libc::c_int {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_is_bot()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    ffi_msg.message.is_bot() as libc::c_int
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_msg_get_ephemeral_timer(msg: *mut dc_msg_t) -> u32 {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_ephemeral_timer()");
@@ -3695,8 +3705,9 @@ pub unsafe extern "C" fn dc_accounts_get_selected_account(
     }
 
     let accounts = &*accounts;
-    let ctx = block_on(accounts.get_selected_account());
-    Box::into_raw(Box::new(ctx))
+    block_on(accounts.get_selected_account())
+        .map(|ctx| Box::into_raw(Box::new(ctx)))
+        .unwrap_or_else(std::ptr::null_mut)
 }
 
 #[no_mangle]

@@ -128,7 +128,7 @@ pub(crate) async fn dc_receive_imf_inner(
     // the other To:/Cc: in the 3rd pass)
     // or if From: is equal to SELF (in this case, it is any outgoing messages,
     // we do not check Return-Path any more as this is unreliable, see
-    // https://github.com/deltachat/deltachat-core/issues/150)
+    // <https://github.com/deltachat/deltachat-core/issues/150>)
     //
     // If this is a mailing list email (i.e. list_id_header is some), don't change the displayname because in
     // a mailing list the sender displayname sometimes does not belong to the sender email address.
@@ -730,9 +730,7 @@ async fn add_parts(
                 }
             }
             if chat_id.is_unset() && allow_creation {
-                let create_blocked = if MessengerMessage::No != is_dc_message
-                    && !Contact::is_blocked_load(context, to_id).await
-                {
+                let create_blocked = if !Contact::is_blocked_load(context, to_id).await {
                     Blocked::Not
                 } else {
                     Blocked::Deaddrop
@@ -942,12 +940,12 @@ async fn add_parts(
 
     let mime_headers = if save_mime_headers || save_mime_modified {
         if mime_parser.was_encrypted() && !mime_parser.decoded_data.is_empty() {
-            String::from_utf8_lossy(&mime_parser.decoded_data).to_string()
+            mime_parser.decoded_data.clone()
         } else {
-            String::from_utf8_lossy(imf_raw).to_string()
+            imf_raw.to_vec()
         }
     } else {
-        "".into()
+        Vec::new()
     };
 
     let sent_timestamp = *sent_timestamp;
@@ -1050,9 +1048,9 @@ INSERT INTO msgs
             part.bytes as isize,
             is_hidden,
             if (save_mime_headers || mime_modified) && !trash {
-                mime_headers.to_string()
+                mime_headers.clone()
             } else {
-                "".to_string()
+                Vec::new()
             },
             mime_in_reply_to,
             mime_references,
@@ -1968,7 +1966,7 @@ async fn check_verified_properties(
                 // - use the gossip-key as verified-key if there is no verified-key
                 // - OR if the verified-key does not match public-key or gossip-key
                 //   (otherwise a verified key can _only_ be updated through QR scan which might be annoying,
-                //   see https://github.com/nextleap-project/countermitm/issues/46 for a discussion about this point)
+                //   see <https://github.com/nextleap-project/countermitm/issues/46> for a discussion about this point)
                 if !is_verified
                     || peerstate.verified_key_fingerprint != peerstate.public_key_fingerprint
                         && peerstate.verified_key_fingerprint != peerstate.gossip_key_fingerprint
@@ -3664,8 +3662,9 @@ YEAAAAAA!.
         assert_eq!(msg.get_text(), Some("hi!".to_string()));
         assert!(!msg.get_showpadlock());
         let mime = message::get_mime_headers(&bob, msg.id).await?;
-        assert!(mime.contains("Received:"));
-        assert!(mime.contains("From:"));
+        let mime_str = String::from_utf8_lossy(&mime);
+        assert!(mime_str.contains("Received:"));
+        assert!(mime_str.contains("From:"));
 
         // another one, from bob to alice, that gets encrypted
         let chat_bob = bob.create_chat(&alice).await;
@@ -3675,8 +3674,9 @@ YEAAAAAA!.
         assert_eq!(msg.get_text(), Some("ho!".to_string()));
         assert!(msg.get_showpadlock());
         let mime = message::get_mime_headers(&alice, msg.id).await?;
-        assert!(mime.contains("Received:"));
-        assert!(mime.contains("From:"));
+        let mime_str = String::from_utf8_lossy(&mime);
+        assert!(mime_str.contains("Received:"));
+        assert!(mime_str.contains("From:"));
         Ok(())
     }
 
@@ -4012,7 +4012,7 @@ YEAAAAAA!.
 
     #[async_std::test]
     async fn test_dont_show_all_outgoing_msgs_in_self_chat() {
-        // Regression test for https://github.com/deltachat/deltachat-android/issues/1940:
+        // Regression test for <https://github.com/deltachat/deltachat-android/issues/1940>:
         // Some servers add a `Bcc: <Self>` header, which caused all outgoing messages to
         // be shown in the self-chat.
         let t = TestContext::new_alice().await;
@@ -4037,5 +4037,38 @@ Message content",
 
         let msg = t.get_last_msg().await;
         assert_ne!(msg.chat_id, t.get_self_chat().await.id);
+    }
+
+    #[async_std::test]
+    async fn test_outgoing_classic_mail_creates_chat() {
+        let alice = TestContext::new_alice().await;
+
+        // Alice enables classic emails.
+        alice
+            .set_config(Config::ShowEmails, Some("2"))
+            .await
+            .unwrap();
+
+        // Alice downloads outgoing classic email.
+        dc_receive_imf(
+            &alice,
+            b"Received: from [127.0.0.1]
+Subject: Subj
+Message-ID: <abcd@example.com>
+To: <bob@example.org>
+From: <alice@example.com>
+
+Message content",
+            "Sent",
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Outgoing email should create a chat.
+        let msg = alice.get_last_msg().await;
+        assert_ne!(msg.chat_id, DC_CHAT_ID_DEADDROP);
+        assert_eq!(msg.get_text().unwrap(), "Subj – Message content");
     }
 }
