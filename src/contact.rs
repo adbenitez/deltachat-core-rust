@@ -1853,8 +1853,17 @@ mod tests {
         assert!(Contact::create(&t, "", "dskjf@dslk@sadkljdk")
             .await
             .is_err());
-        assert!(Contact::create(&t.ctx, "", "dskjf dslk@d.e").await.is_err());
-        assert!(Contact::create(&t.ctx, "", "<dskjf dslk@sadklj.dk")
+        assert!(Contact::create(&t, "", "dskjf dslk@d.e").await.is_err());
+        assert!(Contact::create(&t, "", "<dskjf dslk@sadklj.dk")
+            .await
+            .is_err());
+    }
+
+    #[async_std::test]
+    async fn test_lookup_id_by_addr() {
+        let t = TestContext::new().await;
+
+        let id = Contact::lookup_id_by_addr(&t.ctx, "the.other@example.net", Origin::Unknown)
             .await
             .unwrap();
         assert!(id.is_none());
